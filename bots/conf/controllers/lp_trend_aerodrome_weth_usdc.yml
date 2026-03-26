@@ -1,0 +1,43 @@
+id: lp_trend_aerodrome_weth_usdc
+controller_name: lp_trend_rebalancer
+controller_type: generic
+
+# Pool configuration — Aerodrome Slipstream WETH/USDC 0.05% on Base
+# tickSpacing=100, dynamic fee (~0.06%), AERO gauge rewards
+connector_name: aerodrome/clmm
+trading_pair: WETH-USDC
+pool_address: "0xb2cc224c1c9fee385f8ad6a55b4d94e92359dc59"
+
+# Position sizing — $100 initial test
+total_amount_quote: "100"
+side: 0  # 0=BOTH
+
+# Candle source for EMA (Binance CEX for reliable data)
+candles_connector: binance
+candles_trading_pair: ETH-USDT
+candles_interval: "1h"
+
+# EMA regime detection
+ema_period: 24
+ema_uptrend_threshold_pct: "0.5"
+ema_downtrend_threshold_pct: "0.5"
+
+# Regime-specific position width
+position_width_pct: "18"
+uptrend_width_pct: "40"
+sideways_width_pct: "18"
+
+# Max position duration per regime
+uptrend_max_duration_hours: "120"
+sideways_max_duration_hours: "72"
+
+# Drawdown stop
+max_drawdown_pct: "8"
+
+# Idle in downtrend
+idle_in_downtrend: true
+
+# Rebalance parameters
+rebalance_seconds: 300
+rebalance_threshold_pct: "1.0"
+position_offset_pct: "0.01"
