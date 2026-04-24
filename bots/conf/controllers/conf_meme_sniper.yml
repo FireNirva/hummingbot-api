@@ -1,0 +1,82 @@
+id: meme_sniper_1
+controller_name: meme_sniper
+controller_type: generic
+
+# Gateway (container internal network)
+gateway_url: "http://gateway-meme-sniper:15888"
+wallet_address: "FNKFnTq9p6pcwEtDkZnDSaGH9EaAC9AYV9xxUgvy8qkb"
+connector: "jupiter/router"
+chain_network: "solana-mainnet-beta"
+
+# Strategy params
+# P11 deployment 2026-04-07: XGBRegressor (clean dataset 3114 samples), thr=0.3477
+position_size_usd: 10
+survival_threshold: 0.35           # fallback only — P11 threshold sourced from pkl (0.3477)
+stop_loss_pct: 0.30
+time_limit_sec: 1800               # 30min (was 7200=120min) — P10 alpha decays after 30min
+slippage_pct: 2.0
+max_buy_price_impact_pct: 0.05
+max_buy_vs_mid_premium_pct: 0.10
+require_live_market_snapshot: true
+require_route_uses_biggest_pool: true
+
+# Trailing stop: P10 strategy — activate at +50%, drop 10% from peak
+# Was +100% activation (legacy), but +50% captures right tail in 30min window
+# P10 trailing — empirical optimum from full sweep on 500 picks (2026-04-07):
+# (act=0.50, drop=0.05): $1549 vs current (0.50, 0.10) $1387 = +11.7% improvement
+# (act=0.70, drop=0.05) is slightly better at $1607 but more concentrated risk
+# Tighter drop captures peaks better in fast-moving meme tokens
+trailing_activation_pct: 0.50
+trailing_drop_pct: 0.05
+
+# Risk management
+max_positions: 5
+cooldown_sec: 30
+candidate_queue_ttl_sec: 120
+daily_loss_limit_usd: 200
+max_total_trades: 100
+max_consecutive_losses: 50
+
+# Per-token stop-loss blacklist (don't re-buy a token that just stopped out)
+token_stoploss_cooldown_sec: 1800
+
+# Anti-pump-dump filters (added 2026-04-06)
+# Reject tokens where 5min return already > 25% (buying the top of a pump-dump)
+# Tightened from 0.50→0.25 (2026-04-06): glans +30% 5min_return → -96% loss
+# Relaxed from 0.25→0.50: MOON at +29% went on to +110%. M3 impact/premium check
+# is the real execution safety net, not this static filter.
+max_5min_return: 0.50
+# Relaxed from 1.5→5.0: PumpFun tokens at $10K liq naturally have vol/liq 2-5x
+# in first 5 minutes. 1.5 rejected 20 tokens. M3 checks protect against bad execution.
+max_vol_liq_ratio: 5.0
+
+# Data sources
+gmgn_base_url: "https://openapi.gmgn.ai"
+# Raised from 5000→50000 (2026-04-06): P8.5 shows momentum only works in high-liq subset
+# 68 trades at $5K min_liq: all tokens $12-18K liq, total PnL -$61, win rate 38%
+# Lowered from 10K→5K: PumpFun initial liq is $5-8K, most tokens stuck at $5-10K.
+# M3 live snapshot + impact/premium checks protect execution safety.
+min_liquidity_usd: 5000
+graduation_poll_interval: 10
+# P10 needs bar at minute 5 fully closed (available at grad+360s, not grad+300s)
+# Without this, bar 5 has 0s of swap data and all features are skewed vs training
+feature_delay_sec: 360
+price_poll_interval: 10
+swap_poll_interval: 30
+
+# GMGN Trending discovery — find high-liq tokens from any DEX (Meteora, Raydium, PumpSwap)
+trending_enabled: false
+trending_poll_interval: 120
+# Tightened from 3600→600 (2026-04-06): momentum decays after ~10min, model trained on 5min post-grad
+trending_max_token_age_sec: 600
+
+# Chainstack on-chain discovery (Tier 1) — reads CHAINSTACK_SOLANA_RPC from env if empty
+chainstack_rpc_url: ""
+# Raised 50→200→1000: PumpFun has 1000+ txs per 10s, batch=200 missed ~80% of graduations
+# Pagination added (max 5 pages) to close any remaining gaps
+# concurrency=3 is max sustainable for Chainstack free tier (~25 RPS limit)
+chainstack_batch_size: 1000
+chainstack_tx_concurrency: 3
+
+# Model (mounted at container path)
+model_path: "/home/hummingbot/models/p11_production_model.pkl"
