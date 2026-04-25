@@ -264,6 +264,7 @@ def compute_hc(pre_t: pd.DataFrame) -> dict:
 
 def compute_all_features(
     swaps: pd.DataFrame, t: int, grad_time: int,
+    *, feature_window: int = FEATURE_WINDOW,
 ) -> dict[str, Any] | None:
     """
     Produce all 25 features plus the Tier A counts (n_swaps_window / _late)
@@ -274,6 +275,10 @@ def compute_all_features(
       token_amount, effective_price_sol
     t:         decision time (unix seconds)
     grad_time: token's graduation time (unix seconds)
+    feature_window: lookback window in seconds (default 180 = training
+      distribution). Pass 300 only as a sparse-data fallback; sum-type
+      features (sf_swap_density, tb_ofi_180s, etc.) become scale-shifted
+      relative to training, so use only when 180s would otherwise return None.
 
     Returns None if cannot compute (too few swaps).
     """
@@ -287,12 +292,12 @@ def compute_all_features(
 
     pre_t = swaps.iloc[:pre_t_mask.sum()]  # sorted, so first N where bt ≤ t
 
-    win_mask = (block_times >= t - FEATURE_WINDOW) & (block_times <= t)
+    win_mask = (block_times >= t - feature_window) & (block_times <= t)
     if win_mask.sum() < MIN_SWAPS_FEATURE_WIN:
         return None
     win = swaps.loc[win_mask]
     early = swaps.loc[
-        (block_times >= t - FEATURE_WINDOW) & (block_times <= t - EARLY_SEG_END)
+        (block_times >= t - feature_window) & (block_times <= t - EARLY_SEG_END)
     ]
     late = swaps.loc[(block_times >= t - LATE_SEG_START) & (block_times <= t)]
 
@@ -361,6 +366,161 @@ def load_f2a_hc_live_v1():
     replacement decision in §9.9 of Phase_14y_Enhancement_FROZEN_2026-04-24.md.
     """
     return _load_model("swap_exit_f2a_hc_live_v1.pkl")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v3 Enhanced — event-anchored rug predictor (LogReg + StandardScaler)
+# Trained via source-stratified split + 28 features (4 redundant dropped)
+# See Phase_14y_v3_EventAnchored_FROZEN_2026-04-25.md §14.8
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Features dropped from v3 audit (redundant, |r|>0.85 with kept feature)
+V3_REDUNDANT_DROPPED = {
+    "sf_last2m_net_flow",   # r=1.000 with tb_ofi_60s
+    "sf_swap_density_late", # r=0.932 with sf_swap_density
+    "hc_top1_share_t",      # r=0.969 with hc_hhi_t
+    "hc_hhi_t",             # dropped; keep top3_share + entropy + gini
+}
+
+V3_EXTRA_FEATURES = [
+    "tb_ofi_60s", "tb_vpin_60s", "sf_price_return_60s",
+    "sf_price_volatility_60s", "sf_vol_decay_ratio",
+    "sf_buyer_repeat_rate", "sf_time_since_last_big_sell",
+]
+V3_ENHANCED_FEATURE_ORDER = [
+    f for f in F2A_HC_FEATURE_ORDER if f not in V3_REDUNDANT_DROPPED
+] + V3_EXTRA_FEATURES  # 28 features
+
+
+def compute_v3_extra_features(
+    swaps: pd.DataFrame, t: int, *, feature_window: int = FEATURE_WINDOW,
+) -> dict | None:
+    """Compute 7 v3-specific features. last_60 always uses fixed 60s; early_60
+    uses [t-feature_window, t-60). Default feature_window=180 = training.
+    """
+    bt = swaps["block_time"].to_numpy()
+    pre_t_mask = bt <= t
+    if pre_t_mask.sum() < 5:
+        return None
+
+    pre_t = swaps.iloc[:pre_t_mask.sum()]  # relies on pre-sorted
+    last_60 = pre_t[pre_t["block_time"] >= t - 60]
+    early_60 = pre_t[(pre_t["block_time"] >= t - feature_window) & (pre_t["block_time"] < t - 60)]
+
+    feats = {}
+
+    # tb_ofi_60s
+    if len(last_60) > 0:
+        feats["tb_ofi_60s"] = float(
+            (last_60["sol_amount"] * (2 * last_60["is_buy"] - 1)).sum())
+    else:
+        feats["tb_ofi_60s"] = 0.0
+
+    # tb_vpin_60s
+    if len(last_60) > 0:
+        total_vol = float(last_60["sol_amount"].sum())
+        if total_vol > 0:
+            buy_vol = float(last_60.loc[last_60["is_buy"] == 1, "sol_amount"].sum())
+            sell_vol = total_vol - buy_vol
+            feats["tb_vpin_60s"] = abs(buy_vol - sell_vol) / total_vol
+        else:
+            feats["tb_vpin_60s"] = 0.0
+    else:
+        feats["tb_vpin_60s"] = 0.0
+
+    # sf_price_return_60s
+    if len(last_60) > 0 and len(early_60) > 0:
+        p_now = float(last_60["effective_price_sol"].iloc[-1])
+        p_60s_ago = float(early_60["effective_price_sol"].iloc[-1])
+        feats["sf_price_return_60s"] = float(
+            np.log(p_now / p_60s_ago) if (p_60s_ago > 0 and p_now > 0) else 0.0)
+    else:
+        feats["sf_price_return_60s"] = 0.0
+
+    # sf_price_volatility_60s
+    if len(last_60) >= 3:
+        prices = last_60["effective_price_sol"].to_numpy()
+        if np.all(prices > 0):
+            feats["sf_price_volatility_60s"] = float(np.std(np.diff(np.log(prices))))
+        else:
+            feats["sf_price_volatility_60s"] = 0.0
+    else:
+        feats["sf_price_volatility_60s"] = 0.0
+
+    # sf_vol_decay_ratio
+    vol_last = float(last_60["sol_amount"].sum())
+    vol_early = float(early_60["sol_amount"].sum())
+    feats["sf_vol_decay_ratio"] = float(vol_last / max(vol_early, 0.01))
+
+    # sf_buyer_repeat_rate
+    buyers_last = set(last_60.loc[last_60["is_buy"] == 1, "trader_address"].unique()) - {""}
+    if buyers_last:
+        traders_before = set(pre_t.loc[pre_t["block_time"] < t - 60, "trader_address"].unique()) - {""}
+        feats["sf_buyer_repeat_rate"] = float(len(buyers_last & traders_before) / len(buyers_last))
+    else:
+        feats["sf_buyer_repeat_rate"] = 0.0
+
+    # sf_time_since_last_big_sell
+    big_sells = pre_t[(pre_t["is_buy"] == 0) & (pre_t["sol_amount"] >= 5.0)]
+    if len(big_sells) > 0:
+        feats["sf_time_since_last_big_sell"] = float(t - big_sells["block_time"].iloc[-1])
+    else:
+        feats["sf_time_since_last_big_sell"] = 9999.0
+
+    return feats
+
+
+def load_14y_v3_enhanced():
+    """Event-anchored rug predictor (v3). LogReg + StandardScaler over 28 features.
+    Payload has: lr_model, scaler, feature_cols, cutoff.
+    See Phase_14y_v3_EventAnchored_FROZEN_2026-04-25.md §14.8.
+    """
+    return _load_model("swap_exit_f2a_hc_v3_enhanced.pkl")
+
+
+V3_FALLBACK_WINDOWS = (180, 300)
+V3_LAST_WINDOW_USED: int | None = None  # diagnostic — 180 = primary, 300 = sparse-fallback
+
+
+def predict_14y_v3(swaps: pd.DataFrame, t: int, grad_time: int) -> float | None:
+    """Score with v3 LogReg. Returns rug probability in [0, 1] or None if
+    insufficient data.
+
+    Multi-window inference (2026-04-25): tries the primary 180s window first
+    (training distribution). When that returns None due to swap-density
+    shortfall, retries at 300s as a sparse-data fallback. The 300s path is
+    OOD relative to training (sum-type features ~1.67× larger), but a
+    conservative score is preferable to silently dropping the position from
+    the shadow log. Module-level `V3_LAST_WINDOW_USED` records which window
+    actually scored — caller can log/persist it for offline auditing.
+    """
+    global V3_LAST_WINDOW_USED
+    V3_LAST_WINDOW_USED = None
+
+    try:
+        m_data = load_14y_v3_enhanced()
+    except Exception:
+        return None
+    lr = m_data.get("lr_model")
+    scaler = m_data.get("scaler")
+    feature_cols = m_data.get("feature_cols", V3_ENHANCED_FEATURE_ORDER)
+    if lr is None or scaler is None:
+        return None
+
+    for fw in V3_FALLBACK_WINDOWS:
+        base_feats = compute_all_features(swaps, t, grad_time, feature_window=fw)
+        if base_feats is None:
+            continue
+        extras = compute_v3_extra_features(swaps, t, feature_window=fw)
+        if extras is None:
+            continue
+        all_feats = {**base_feats, **extras}
+        x = np.asarray([[float(all_feats.get(f, 0.0)) for f in feature_cols]])
+        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        x_s = scaler.transform(x)
+        V3_LAST_WINDOW_USED = fw
+        return float(lr.predict_proba(x_s)[0, 1])
+    return None
 
 
 def predict(

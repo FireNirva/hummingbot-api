@@ -4265,6 +4265,21 @@ class TradeDB:
         "ALTER TABLE shadow_exit_warn_evals ADD COLUMN p_rug_live_v1 REAL",
     ]
 
+    # 2026-04-25: v3 event-anchored LogReg model (swap_exit_f2a_hc_v3_enhanced.pkl).
+    # See Phase_14y_v3_EventAnchored_FROZEN_2026-04-25.md §14.8.
+    MIGRATE_SHADOW_EXIT_WARN_EVALS_V3 = [
+        "ALTER TABLE shadow_exit_warn_evals ADD COLUMN p_rug_v3 REAL",
+    ]
+
+    # 2026-04-25: v3 multi-window inference (180s primary, 300s sparse fallback).
+    # `p_rug_v3_window` records which feature_window actually scored: 180 or 300.
+    # 300s scores are OOD relative to training (compressed distribution); needs
+    # per-window cutoff calibration from shadow data before being used to gate
+    # production exits. See Appendix C of the v3 FROZEN plan.
+    MIGRATE_SHADOW_EXIT_WARN_EVALS_V4 = [
+        "ALTER TABLE shadow_exit_warn_evals ADD COLUMN p_rug_v3_window INTEGER",
+    ]
+
     DDL_TOKEN_OBSERVATIONS = """
     CREATE TABLE IF NOT EXISTS token_observations (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4703,6 +4718,8 @@ class TradeDB:
             self._migrate_table("token_observations", self.MIGRATE_OBSERVATIONS_V7)
             self._migrate_table("token_observations", self.MIGRATE_OBSERVATIONS_V8)
             self._migrate_table("shadow_exit_warn_evals", self.MIGRATE_SHADOW_EXIT_WARN_EVALS_V2)
+            self._migrate_table("shadow_exit_warn_evals", self.MIGRATE_SHADOW_EXIT_WARN_EVALS_V3)
+            self._migrate_table("shadow_exit_warn_evals", self.MIGRATE_SHADOW_EXIT_WARN_EVALS_V4)
             self._conn.commit()
         self._telemetry_sink: Optional[PostgresTelemetrySink] = None
         telemetry_dsn = os.environ.get("TELEMETRY_DATABASE_URL", "").strip()
@@ -5696,12 +5713,16 @@ class TradeDB:
                                      n_cache_swaps: Optional[int],
                                      feature_window_count: Optional[int],
                                      features_json: Optional[str] = None,
-                                     p_rug_live_v1: Optional[float] = None):
-        """One row per (position, decision_tick) from the 14y dual-model
+                                     p_rug_live_v1: Optional[float] = None,
+                                     p_rug_v3: Optional[float] = None,
+                                     p_rug_v3_window: Optional[int] = None):
+        """One row per (position, decision_tick) from the 14y multi-model
         inference hook. Resolved asynchronously 60s later.
 
-        `p_rug_live_v1` is the bot-schema retrain score (2026-04-24 A/B).
-        See Phase_14y_Enhancement_FROZEN_2026-04-24.md §9.9.
+        `p_rug_live_v1` is the bot-schema retrain (2026-04-24 A/B).
+        `p_rug_v3` is the v3 event-anchored LogReg (2026-04-25).
+        `p_rug_v3_window` records the feature_window that produced p_rug_v3:
+        180 = primary (training distribution), 300 = sparse-data fallback (OOD).
         """
         self._execute_commit(
             """INSERT INTO shadow_exit_warn_evals
@@ -5709,13 +5730,14 @@ class TradeDB:
                 dt_from_entry, dt_from_grad,
                 p_drop_raw, p_rug_raw, mid_price_sol,
                 n_cache_swaps, feature_window_count,
-                resolved, features_json, p_rug_live_v1)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?,?)""",
+                resolved, features_json, p_rug_live_v1, p_rug_v3,
+                p_rug_v3_window)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?)""",
             (time.time(), position_id, mint_address, symbol,
              dt_from_entry, dt_from_grad,
              p_drop_raw, p_rug_raw, mid_price_sol,
              n_cache_swaps, feature_window_count,
-             features_json, p_rug_live_v1))
+             features_json, p_rug_live_v1, p_rug_v3, p_rug_v3_window))
 
     def fetch_unresolved_shadow_exit_warn_evals(self, older_than_sec: float = 60.0,
                                                 limit: int = 1000) -> list:

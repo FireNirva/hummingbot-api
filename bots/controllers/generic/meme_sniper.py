@@ -2833,8 +2833,15 @@ class MemeSniper(ControllerBase):
             except Exception as e_v1:
                 logger.warning(f"14y: live_v1 model not loaded: {e_v1}")
                 live_v1_ok = False
+            try:
+                mdl.load_14y_v3_enhanced()
+                v3_ok = True
+            except Exception as e_v3:
+                logger.warning(f"14y: v3_enhanced model not loaded: {e_v3}")
+                v3_ok = False
             logger.info("14y: exit-warn models loaded "
-                        f"(Tier B 19 feat + F2a+HC 25 feat + live_v1={'yes' if live_v1_ok else 'no'})")
+                        f"(Tier B + F2a+HC + live_v1={'yes' if live_v1_ok else 'no'}"
+                        f" + v3={'yes' if v3_ok else 'no'})")
         except Exception as e:
             logger.error(f"14y: failed to load exit-warn models: {e}",
                          exc_info=True)
@@ -2910,6 +2917,18 @@ class MemeSniper(ControllerBase):
             except Exception as e_v1:
                 logger.debug(f"14y live_v1 score failed for {mint[:10]}: {e_v1}")
                 p_rug_live_v1 = None
+            # v3 enhanced (event-anchored LogReg) — 2026-04-25
+            # Multi-window inference: tries 180s primary, falls back to 300s
+            # when sparse. Window used is recorded for offline calibration.
+            p_rug_v3_window: Optional[int] = None
+            try:
+                p_rug_v3 = mdl.predict_14y_v3(df, t, int(grad_time))
+                if p_rug_v3 is not None:
+                    p_rug_v3 = float(p_rug_v3)
+                    p_rug_v3_window = mdl.V3_LAST_WINDOW_USED
+            except Exception as e_v3:
+                logger.debug(f"14y v3 score failed for {mint[:10]}: {e_v3}")
+                p_rug_v3 = None
 
             # Smoothed mid = last swap's effective_price_sol (5-swap rolling
             # median already applied internally to feature compute; approximate
@@ -2929,6 +2948,8 @@ class MemeSniper(ControllerBase):
                 feature_window_count=int(feats.get("sf_swap_density", 0)),
                 features_json=None,
                 p_rug_live_v1=p_rug_live_v1,
+                p_rug_v3=p_rug_v3,
+                p_rug_v3_window=p_rug_v3_window,
             )
         except Exception as e:
             logger.debug(f"14y shadow-exit-warn tick failed for {mint[:10]}: {e}")
