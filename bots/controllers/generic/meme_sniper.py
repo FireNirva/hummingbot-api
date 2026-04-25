@@ -2905,18 +2905,23 @@ class MemeSniper(ControllerBase):
             feats = mdl.compute_all_features(df, t, grad_time)
             if feats is None:
                 return
-            x_tb = mdl.to_feature_array(
-                feats, mdl.TIER_B_FEATURE_ORDER).reshape(1, -1)
             x_fh = mdl.to_feature_array(
                 feats, mdl.F2A_HC_FEATURE_ORDER).reshape(1, -1)
-            p_drop = float(mdl.load_tier_b()["model"].predict_proba(x_tb)[0, 1])
+
+            # ─── DEPRECATED 2026-04-25: p_drop_raw (Tier B 19-feature) ───
+            # Real-trade backtest (29 trades): AUC 0.43 (INVERTED), recall 12%
+            # @ FPR 43%. Score is anti-correlated with bot losses. See
+            # Phase_14y_v2_TargetAligned §1.1 + Phase_14y_v4 §C audit.
+            # Kept as sentinel 0.0 because schema column is NOT NULL.
+            p_drop = 0.0  # sentinel — deprecated, do not use
+
             p_rug = float(mdl.load_f2a_hc()["model"].predict_proba(x_fh)[0, 1])
-            try:
-                p_rug_live_v1 = float(
-                    mdl.load_f2a_hc_live_v1()["model"].predict_proba(x_fh)[0, 1])
-            except Exception as e_v1:
-                logger.debug(f"14y live_v1 score failed for {mint[:10]}: {e_v1}")
-                p_rug_live_v1 = None
+
+            # ─── DEPRECATED 2026-04-25: p_rug_live_v1 (bot-schema retrain) ───
+            # Score distribution collapsed to [0.03, 0.255] — never crosses any
+            # actionable cutoff. Real-trade recall = 0/10. Spearman ρ=0.73 with
+            # p_rug_raw → fully redundant. See Phase_14y_v4 §C audit.
+            p_rug_live_v1: Optional[float] = None  # column nullable
             # v3 enhanced (event-anchored LogReg) — 2026-04-25
             # Multi-window inference: tries 180s primary, falls back to 300s
             # when sparse. Window used is recorded for offline calibration.

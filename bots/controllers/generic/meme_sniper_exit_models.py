@@ -352,6 +352,16 @@ def _load_model(filename: str):
 
 
 def load_tier_b():
+    """⚠️ DEPRECATED 2026-04-25 — DO NOT USE FOR DECISIONS.
+
+    Tier B 19-feature `p_drop_raw` model. Real-trade backtest (29 trades)
+    showed AUC 0.43 (INVERTED — score anti-correlated with bot losses):
+      Avg score on RUG: 0.422  vs  WIN: 0.477  (wrong direction)
+      Recall@0.50 = 12%, FPR@0.50 = 43%
+    See `Phase_14y_v2_TargetAligned_FROZEN_2026-04-25.md` §1.1 for backtest
+    details. Loader retained for historical pkl access only; no production
+    code path should compute predictions from this model.
+    """
     return _load_model("swap_exit_tier_b_model.pkl")
 
 
@@ -360,10 +370,13 @@ def load_f2a_hc():
 
 
 def load_f2a_hc_live_v1():
-    """Live-schema retrain (2026-04-24). Trained on bot `swaps` table with
-    identical feature extractor → zero training/deployment schema shift.
-    Runs in parallel with Birdeye-trained model for 2-week A/B shadow;
-    replacement decision in §9.9 of Phase_14y_Enhancement_FROZEN_2026-04-24.md.
+    """⚠️ DEPRECATED 2026-04-25 — DO NOT USE FOR DECISIONS.
+
+    Bot-schema retrain (2026-04-24 A/B). Score distribution collapsed to
+    [0.03, 0.255] — never crosses any actionable cutoff in production.
+    Real-trade backtest: recall = 0/10. Spearman ρ = 0.73 with `p_rug_raw`
+    (fully redundant). See `Phase_14y_v4_PositionConditional_FROZEN_2026-04-25.md`
+    Appendix C audit. Loader retained for historical pkl access only.
     """
     return _load_model("swap_exit_f2a_hc_live_v1.pkl")
 
