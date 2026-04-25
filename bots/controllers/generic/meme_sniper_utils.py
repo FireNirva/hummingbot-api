@@ -4280,6 +4280,17 @@ class TradeDB:
         "ALTER TABLE shadow_exit_warn_evals ADD COLUMN p_rug_v3_window INTEGER",
     ]
 
+    # 2026-04-25: v4 position-conditional 3-horizon ensemble.
+    # `p_rug_v4` is the deployed ensemble (0.6 × y_60s + 0.4 × y_120s, calibrated).
+    # Per-horizon scores `p_rug_v4_y60s` / `p_rug_v4_y120s` saved separately for
+    # per-horizon cutoff calibration in 2-week shadow accumulation.
+    # See Phase_14y_v4_PositionConditional_FROZEN_2026-04-25.md (Appendix E.8).
+    MIGRATE_SHADOW_EXIT_WARN_EVALS_V5 = [
+        "ALTER TABLE shadow_exit_warn_evals ADD COLUMN p_rug_v4 REAL",
+        "ALTER TABLE shadow_exit_warn_evals ADD COLUMN p_rug_v4_y60s REAL",
+        "ALTER TABLE shadow_exit_warn_evals ADD COLUMN p_rug_v4_y120s REAL",
+    ]
+
     DDL_TOKEN_OBSERVATIONS = """
     CREATE TABLE IF NOT EXISTS token_observations (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4720,6 +4731,7 @@ class TradeDB:
             self._migrate_table("shadow_exit_warn_evals", self.MIGRATE_SHADOW_EXIT_WARN_EVALS_V2)
             self._migrate_table("shadow_exit_warn_evals", self.MIGRATE_SHADOW_EXIT_WARN_EVALS_V3)
             self._migrate_table("shadow_exit_warn_evals", self.MIGRATE_SHADOW_EXIT_WARN_EVALS_V4)
+            self._migrate_table("shadow_exit_warn_evals", self.MIGRATE_SHADOW_EXIT_WARN_EVALS_V5)
             self._conn.commit()
         self._telemetry_sink: Optional[PostgresTelemetrySink] = None
         telemetry_dsn = os.environ.get("TELEMETRY_DATABASE_URL", "").strip()
@@ -5715,7 +5727,10 @@ class TradeDB:
                                      features_json: Optional[str] = None,
                                      p_rug_live_v1: Optional[float] = None,
                                      p_rug_v3: Optional[float] = None,
-                                     p_rug_v3_window: Optional[int] = None):
+                                     p_rug_v3_window: Optional[int] = None,
+                                     p_rug_v4: Optional[float] = None,
+                                     p_rug_v4_y60s: Optional[float] = None,
+                                     p_rug_v4_y120s: Optional[float] = None):
         """One row per (position, decision_tick) from the 14y multi-model
         inference hook. Resolved asynchronously 60s later.
 
@@ -5723,6 +5738,10 @@ class TradeDB:
         `p_rug_v3` is the v3 event-anchored LogReg (2026-04-25).
         `p_rug_v3_window` records the feature_window that produced p_rug_v3:
         180 = primary (training distribution), 300 = sparse-data fallback (OOD).
+        `p_rug_v4` is the v4 position-conditional ensemble
+        (0.6 × calibrated y_60s + 0.4 × calibrated y_120s) — the deploy signal.
+        `p_rug_v4_y60s` / `p_rug_v4_y120s` are the per-horizon calibrated scores
+        (saved separately for per-horizon cutoff calibration during shadow).
         """
         self._execute_commit(
             """INSERT INTO shadow_exit_warn_evals
@@ -5731,13 +5750,15 @@ class TradeDB:
                 p_drop_raw, p_rug_raw, mid_price_sol,
                 n_cache_swaps, feature_window_count,
                 resolved, features_json, p_rug_live_v1, p_rug_v3,
-                p_rug_v3_window)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?)""",
+                p_rug_v3_window,
+                p_rug_v4, p_rug_v4_y60s, p_rug_v4_y120s)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?)""",
             (time.time(), position_id, mint_address, symbol,
              dt_from_entry, dt_from_grad,
              p_drop_raw, p_rug_raw, mid_price_sol,
              n_cache_swaps, feature_window_count,
-             features_json, p_rug_live_v1, p_rug_v3, p_rug_v3_window))
+             features_json, p_rug_live_v1, p_rug_v3, p_rug_v3_window,
+             p_rug_v4, p_rug_v4_y60s, p_rug_v4_y120s))
 
     def fetch_unresolved_shadow_exit_warn_evals(self, older_than_sec: float = 60.0,
                                                 limit: int = 1000) -> list:

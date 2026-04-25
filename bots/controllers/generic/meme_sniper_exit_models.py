@@ -537,3 +537,128 @@ def predict(
     p_drop = float(tb.predict_proba(x_tb)[0, 1])
     p_rug = float(fh.predict_proba(x_fh)[0, 1])
     return {"p_drop_raw": p_drop, "p_rug_raw": p_rug}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v4 Position-Conditional — 3-horizon ensemble (XGBoost + isotonic calibration)
+# Trained on 109K rows (Birdeye Mar 5-Apr 13 + bot Apr 15-25, OOS-clean split).
+# Features = 32 v3 + 3 position-state. Drops y_remaining (first-tick AUC ≈ random).
+# Ensemble = 0.6 × calibrated p(y_60s) + 0.4 × calibrated p(y_120s).
+# Cutoff 0.475 (defensible, not test-tuned).
+# See Phase_14y_v4_PositionConditional_FROZEN_2026-04-25.md (Appendix C-E).
+# Shadow-only — no production gate until Day 20 live data review.
+# ─────────────────────────────────────────────────────────────────────────────
+
+V4_PS_FEATURES = ["ps_current_pnl_pct", "ps_hold_sec", "ps_in_ec_window"]
+V4_FEATURES = F2A_HC_FEATURE_ORDER[:]  # base 25
+# Append the 7 v3 extras and 3 PS features in the same order used at training:
+V4_V3_EXTRAS = [
+    "tb_ofi_60s", "tb_vpin_60s", "sf_price_return_60s",
+    "sf_price_volatility_60s", "sf_vol_decay_ratio",
+    "sf_buyer_repeat_rate", "sf_time_since_last_big_sell",
+]
+V4_FEATURE_ORDER = V4_FEATURES + V4_V3_EXTRAS + V4_PS_FEATURES  # 35 total
+V4_HORIZONS_DEPLOYED = ("y_60s", "y_120s")          # drop y_remaining
+V4_ENSEMBLE_WEIGHTS = {"y_60s": 0.6, "y_120s": 0.4}
+V4_DEPLOY_CUTOFF = 0.475
+
+V4_BOT_SL_PCT = 0.25
+V4_BOT_EC_PCT = 0.20
+V4_BOT_EC_WINDOW_SEC = 120
+
+
+def compute_v4_position_state(price_t: float, entry_price: float,
+                               hold_sec: int) -> dict | None:
+    """3 entry-relative features. Mirrors training-time logic in
+    `scripts/build_v4_dataset.py:compute_position_state_features`.
+    """
+    if (entry_price <= 0 or price_t <= 0
+            or not np.isfinite(entry_price) or not np.isfinite(price_t)):
+        return None
+    pnl_pct = (price_t - entry_price) / entry_price
+    if not np.isfinite(pnl_pct):
+        return None
+    pnl_pct = float(np.clip(pnl_pct, -1.0, 5.0))
+    return {
+        "ps_current_pnl_pct": pnl_pct,
+        "ps_hold_sec": float(hold_sec),
+        "ps_in_ec_window": int(hold_sec < V4_BOT_EC_WINDOW_SEC),
+    }
+
+
+def load_14y_v4_3horizon():
+    """Position-conditional v4 ensemble (2026-04-25). Payload contains:
+      - winners: dict[label → {type, model, scaler}]   (XGBoost won all)
+      - calibrators: dict[label → IsotonicRegression]
+      - feature_cols: ordered list of 35 features
+    See Phase_14y_v4_PositionConditional_FROZEN_2026-04-25.md.
+    """
+    return _load_model("swap_exit_v4_3horizon.pkl")
+
+
+def _v4_score_horizon(payload: dict, X: np.ndarray, label: str) -> float:
+    """Apply winner model + calibrator for one horizon. Returns calibrated
+    probability ∈ [0, 1].
+    """
+    w = payload["winners"][label]
+    Xc = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    if w["type"] == "logreg":
+        Xs = w["scaler"].transform(Xc)
+        raw = w["model"].predict_proba(Xs)[:, 1]
+    else:  # xgboost
+        raw = w["model"].predict_proba(Xc)[:, 1]
+    cal = payload.get("calibrators", {}).get(label)
+    return float(cal.transform(raw)[0]) if cal is not None else float(raw[0])
+
+
+def predict_14y_v4(swaps: pd.DataFrame, t: int, grad_time: int,
+                    entry_time: int, entry_price: float
+                    ) -> dict[str, float] | None:
+    """Score with v4 position-conditional ensemble. Returns dict with:
+      - p_y_60s   : calibrated P(SL/EC fires in next 60s)
+      - p_y_120s  : calibrated P(SL/EC fires in next 120s)
+      - p_rug_v4  : 0.6 × p_y_60s + 0.4 × p_y_120s (deploy ensemble)
+    Or None if features can't be computed.
+
+    `entry_time` and `entry_price` are the bot's actual entry — required for
+    position-state features. At inference, the controller passes its own state.
+    """
+    if (entry_price <= 0 or not np.isfinite(entry_price)
+            or t < entry_time):
+        return None
+
+    base_feats = compute_all_features(swaps, t, grad_time)
+    if base_feats is None:
+        return None
+    extras = compute_v3_extra_features(swaps, t)
+    if extras is None:
+        return None
+
+    # Latest mid price ≤ t for position state
+    bt = swaps["block_time"].to_numpy()
+    px = swaps["effective_price_sol"].to_numpy()
+    idx = int(np.searchsorted(bt, t, side="right") - 1)
+    if idx < 0 or px[idx] <= 0 or not np.isfinite(px[idx]):
+        return None
+    price_t = float(px[idx])
+
+    hold_sec = int(t - entry_time)
+    ps = compute_v4_position_state(price_t, entry_price, hold_sec)
+    if ps is None:
+        return None
+
+    all_feats = {**base_feats, **extras, **ps}
+
+    try:
+        m_data = load_14y_v4_3horizon()
+    except Exception:
+        return None
+
+    feat_cols = m_data.get("feature_cols", V4_FEATURE_ORDER)
+    x = np.asarray([[float(all_feats.get(f, 0.0)) for f in feat_cols]])
+
+    out = {}
+    for label, w in V4_ENSEMBLE_WEIGHTS.items():
+        out[f"p_{label}"] = _v4_score_horizon(m_data, x, label)
+    out["p_rug_v4"] = sum(out[f"p_{lbl}"] * w for lbl, w in V4_ENSEMBLE_WEIGHTS.items())
+    return out

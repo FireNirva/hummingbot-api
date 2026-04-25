@@ -2930,6 +2930,25 @@ class MemeSniper(ControllerBase):
                 logger.debug(f"14y v3 score failed for {mint[:10]}: {e_v3}")
                 p_rug_v3 = None
 
+            # v4 position-conditional ensemble (2026-04-25, OOS-clean opt A).
+            # Returns dict with p_y_60s, p_y_120s, p_rug_v4 (deploy ensemble).
+            # SHADOW ONLY — no production gate.
+            p_rug_v4: Optional[float] = None
+            p_rug_v4_y60s: Optional[float] = None
+            p_rug_v4_y120s: Optional[float] = None
+            try:
+                v4_out = mdl.predict_14y_v4(
+                    df, t, int(grad_time),
+                    entry_time=int(pos.entry_time),
+                    entry_price=float(pos.entry_price_sol),
+                )
+                if v4_out is not None:
+                    p_rug_v4 = float(v4_out["p_rug_v4"])
+                    p_rug_v4_y60s = float(v4_out["p_y_60s"])
+                    p_rug_v4_y120s = float(v4_out["p_y_120s"])
+            except Exception as e_v4:
+                logger.debug(f"14y v4 score failed for {mint[:10]}: {e_v4}")
+
             # Smoothed mid = last swap's effective_price_sol (5-swap rolling
             # median already applied internally to feature compute; approximate
             # here with the last swap's price for audit / reconstruction).
@@ -2950,6 +2969,9 @@ class MemeSniper(ControllerBase):
                 p_rug_live_v1=p_rug_live_v1,
                 p_rug_v3=p_rug_v3,
                 p_rug_v3_window=p_rug_v3_window,
+                p_rug_v4=p_rug_v4,
+                p_rug_v4_y60s=p_rug_v4_y60s,
+                p_rug_v4_y120s=p_rug_v4_y120s,
             )
         except Exception as e:
             logger.debug(f"14y shadow-exit-warn tick failed for {mint[:10]}: {e}")
