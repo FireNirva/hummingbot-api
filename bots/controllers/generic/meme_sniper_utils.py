@@ -307,6 +307,11 @@ class TradeCandidate:
     last_swap_price_sol: float = 0.0  # cached at M2 time before flush, used by M3 double-check
     buy_fail_count: int = 0
     buy_last_fail_time: float = 0.0
+    # Phase 16.3 Step 3 — entry-source tracking + per-source sizing override.
+    # entry_source: "" (legacy = vshape/p11), "big_winner_v2", future strategies.
+    # position_size_usd: None falls back to config.position_size_usd at buy time.
+    entry_source: str = ""
+    position_size_usd: Optional[float] = None
 
 
 SNAPSHOT_SCHEDULE = [
@@ -348,11 +353,24 @@ class Position:
     entry_decision_mid_price_sol: Optional[float] = None
     entry_decision_mid_source: Optional[str] = None
     peak_pnl_pct: float = 0.0
+    # B5 fix 2026-05-14: peak from poll-observed prices ONLY (executable).
+    # peak_pnl_pct can be raised by stream sandwich-max which captures spikes
+    # the bot couldn't trade against. Trail drop uses peak_pnl_pct_poll so
+    # it fires against prices the bot has actually had a chance to sell at.
+    peak_pnl_pct_poll: float = 0.0
+    # B6 fix 2026-05-14: track first time pnl crossed -SL threshold so we
+    # can time-escape SL when dip_confirmed stalls on a dead pool.
+    sl_first_breach_ts: Optional[float] = None
     trailing_activated: bool = False
     # V3 execution-quality fields (from M2/M3 preflight)
     m2_ref_price_sol: Optional[float] = None
     preflight_latency_ms: Optional[int] = None
     pool_liq_at_entry_usd: Optional[float] = None
+    # Phase 22.G observability — capacity-aware sizing data
+    pool_sol_reserve_at_entry: Optional[float] = None
+    slippage_per_pool_ratio: Optional[float] = None
+    # Entry-source tracking ("vshape" / "big_winner_v2" / "")
+    entry_source: str = ""
 
     def hold_seconds(self) -> float:
         return time.time() - self.entry_time
@@ -384,6 +402,9 @@ class TradeRecord:
     m2_ref_price_sol: Optional[float] = None
     preflight_latency_ms: Optional[int] = None
     pool_liq_at_entry_usd: Optional[float] = None
+    # Phase 22.G observability — capacity-aware sizing data
+    pool_sol_reserve_at_entry: Optional[float] = None
+    slippage_per_pool_ratio: Optional[float] = None
 
 
 # ──────────────────────────────────────────────
@@ -401,6 +422,7 @@ class SwapRecord:
     is_buy: bool         # True if user bought the base token
     base_amount: float   # token amount traded (human units)
     trader_address: str = ""  # signer / trader used for microstructure overlays
+    signature: str = ""  # tx_hash, persisted for Birdeye-alignment join (Phase 22.D B)
 
 
 class OnChainKlineBuilder:
@@ -482,6 +504,10 @@ class OnChainKlineBuilder:
         """
         if mint not in self._swaps:
             return
+        # Phase 22.D Path B: persist signature on the SwapRecord so it lands
+        # in the swaps.tx_hash column when save_swaps fires.
+        if signature and not getattr(swap, "signature", ""):
+            swap.signature = signature
         self._swaps[mint].append(swap)
         if signature and mint in self._seen_sigs:
             self._seen_sigs[mint].add(signature)
@@ -532,7 +558,13 @@ class OnChainKlineBuilder:
         cursor: Optional[str] = None  # `before` cursor for pagination
 
         for page in range(max_pages):
-            params: dict = {"limit": 200}
+            # Phase 22.D Route X RC4 (2026-05-01): bumped limit 200 → 1000.
+            # Solana RPC supports up to 1000 sigs per call; previous 200 cap
+            # forced 5× more pages on hot tokens (3000 swaps in 30min) and
+            # the 15-page hard ceiling lost the oldest swaps when sustained
+            # rate exceeded 6.7/s. 1000 limit covers the median 30min token
+            # in 4 pages instead of 15+.
+            params: dict = {"limit": 1000}
             if cursor:
                 params["before"] = cursor
 
@@ -569,11 +601,13 @@ class OnChainKlineBuilder:
 
             if new_sigs:
                 tx_results = await self._fetch_transactions_batch(new_sigs)
-                for tx_data in tx_results:
+                for sig, tx_data in zip(new_sigs, tx_results):
                     if tx_data is None:
                         continue
                     swap = self._parse_swap_from_tx(tx_data, mint)
                     if swap:
+                        # Phase 22.D Path B: attach signature for tx_hash column
+                        swap.signature = sig
                         all_new_swaps.append(swap)
 
             # Check if we've covered enough time span
@@ -598,11 +632,12 @@ class OnChainKlineBuilder:
         """Fetch and parse new swap transactions for a single pool."""
         client = await self._get_client()
 
-        # Step 1: Get recent signatures for the pool
+        # Step 1: Get recent signatures for the pool.
+        # Phase 22.D Route X RC4 (2026-05-01): limit 200 → 1000 (see backfill).
         body = {
             "jsonrpc": "2.0", "id": 1,
             "method": "getSignaturesForAddress",
-            "params": [pool, {"limit": 200}],
+            "params": [pool, {"limit": 1000}],
         }
         try:
             resp = await client.post(self._rpc_url, json=body)
@@ -629,11 +664,13 @@ class OnChainKlineBuilder:
 
         # Step 3: Parse swaps from transaction results
         new_swaps = []
-        for tx_data in all_tx_results:
+        for sig, tx_data in zip(new_sigs, all_tx_results):
             if tx_data is None:
                 continue
             swap = self._parse_swap_from_tx(tx_data, mint)
             if swap:
+                # Phase 22.D Path B: attach signature for tx_hash column
+                swap.signature = sig
                 new_swaps.append(swap)
 
         # Sort by timestamp and append
@@ -798,13 +835,28 @@ class OnChainKlineBuilder:
         price_sol = sol_amount / base_amount
         volume_sol = sol_amount
 
+        # --- Step 5: Determine trader_address (Phase 26.X 2026-05-11) ---
+        # Mirror _parse_swap_from_grpc Phase 22.E v2 (geyser_stream.py:1138-1146).
+        # Paymaster-relayed tx have signer (fee payer) outside base_deltas
+        # (e.g. `gasTzr...` gas station, Privy / Helius paymaster). Previously
+        # this path returned the paymaster as trader_address, contaminating
+        # trader-concentration features. Now: prefer signer when signer owns a
+        # token account here (~80% direct-swap case); otherwise pick owner with
+        # largest |delta|.
+        if signer and signer in base_deltas:
+            trader = signer
+        elif base_deltas:
+            trader = max(base_deltas.items(), key=lambda x: abs(x[1]))[0]
+        else:
+            trader = signer or ""
+
         return SwapRecord(
             timestamp=block_time,
             price_sol=price_sol,
             volume_sol=volume_sol,
             is_buy=is_buy,
             base_amount=base_amount,
-            trader_address=signer or "",
+            trader_address=trader,
         )
 
     @staticmethod
@@ -3138,15 +3190,24 @@ class VShapeModel:
 
 
 def detect_vshape_live(kline_bars: List[Dict[str, Any]],
-                       graduation_time: float) -> Optional[Dict[str, float]]:
-    """Detect V-shape pattern from on-chain 1m bars at T+10m.
+                       graduation_time: float,
+                       entry_offset_sec: int = 600) -> Optional[Dict[str, float]]:
+    """Detect V-shape pattern from on-chain 1m bars at configurable entry offset.
 
     Args:
         kline_bars: List of bar dicts with keys: open, high, low, close, volume, time
         graduation_time: Unix timestamp of graduation
+        entry_offset_sec: Entry decision time offset from graduation (default 600 = T+10m).
+                         Pass 300 for T+5m (Phase 15b v1.6 retrain). Other values
+                         require corresponding model retrain — do NOT use mid-deploy
+                         drift.
 
     Returns:
         Dict of vf_* features, or None if insufficient data.
+
+    Byte-parity note (Phase 15b 2026-04-26): Signature was previously hardcoded
+    to 600. Both training and production MUST pass the same `entry_offset_sec`
+    to maintain feature parity. v1.4r calls with 600 (default) — backwards compat.
     """
     if not kline_bars or len(kline_bars) < 3:
         return None
@@ -3176,13 +3237,16 @@ def detect_vshape_live(kline_bars: List[Dict[str, Any]],
     if grad_price <= 0:
         return None
 
-    # Pre-entry bars (first 10 minutes)
-    pre_entry = [b for b in post if b["offset"] <= 600]
+    # Pre-entry bars (strictly BEFORE entry_offset_sec — the bar at
+    # offset==entry_offset_sec covers [entry_offset_sec, entry_offset_sec+60)
+    # which is the future 60s post-entry, so it must NOT contribute to
+    # pre-entry features. Fixed 2026-04-29 per F.5 DeepAudit v2.
+    pre_entry = [b for b in post if b["offset"] < entry_offset_sec]
     if len(pre_entry) < 3:
         return None
 
-    # Entry price at T+10m
-    entry_bars = [b for b in post if b["offset"] >= 600]  # T+10m, matches research 14i
+    # Entry price at entry_offset_sec
+    entry_bars = [b for b in post if b["offset"] >= entry_offset_sec]
     if not entry_bars:
         return None
     entry_price = entry_bars[0]["open"]
@@ -3240,6 +3304,55 @@ def detect_vshape_live(kline_bars: List[Dict[str, Any]],
 
     any_pattern = is_vshape or is_steady_up or is_near_high or is_reversal
 
+    # ─────────────────────── v3.2 NEW PATTERNS (2026-04-29) ───────────────────────
+    # Test on 1000-mint sample showed coverage gap: only 40% of decisions matched
+    # current 4 patterns; the remaining 60% had 30%+ peak ≥ +50% rate.
+    # Adding 3 patterns to lift frequency +23% with quality match. See
+    # `reports/Pattern_Expansion_v3_2_Plan_2026-04-29.md`.
+
+    # 5. is_cup_handle — U-shape: trough first, gentle recovery
+    #    Independent of other patterns (no cascading); model learns combinations.
+    is_cup_handle = 0
+    if len(pre_entry) >= 5 and 0 < trough_idx < len(pre_entry) - 2:
+        if -0.30 <= trough_ret < -0.05:        # mild dip
+            tail_n = max(2, int(len(pre_entry) * 0.3))
+            tail_closes = closes[-tail_n:]
+            if (tail_closes[-1] - tail_closes[0]) >= 0.10:   # tail uptrending
+                if peak_idx >= trough_idx or peak_ret < 0.10:
+                    is_cup_handle = 1
+
+    # 6. is_stair_step — multiple small pumps + shallow pullbacks
+    is_stair_step = 0
+    if len(pre_entry) >= 4:
+        n_bumps = 0
+        last_high = 0.0
+        in_pullback = False
+        for i in range(1, len(pre_entry)):
+            if not in_pullback:
+                if closes[i] > last_high + 0.05:
+                    last_high = closes[i]
+                    in_pullback = True
+            else:
+                if closes[i] < last_high - 0.03:
+                    in_pullback = False
+                elif closes[i] > last_high + 0.05:
+                    last_high = closes[i]
+                    n_bumps += 1
+        if n_bumps >= 2:
+            is_stair_step = 1
+
+    # 7. is_volume_acceleration — late-window volume ≥ 2× early-window + price not crashed
+    is_volume_acceleration = 0
+    if len(pre_entry) >= 6:
+        early_vol = sum(volumes[:3])
+        late_vol = sum(volumes[-3:])
+        if early_vol > 0 and (late_vol / early_vol) >= 2.0:
+            if closes[-1] > -0.10:
+                is_volume_acceleration = 1
+
+    any_pattern_extended = (any_pattern or is_cup_handle or is_stair_step
+                              or is_volume_acceleration)
+
     # Volume ratio
     if trough_idx < len(pre_entry) - 1 and trough_idx > 0:
         pre_vol = sum(volumes[:trough_idx + 1])
@@ -3257,6 +3370,11 @@ def detect_vshape_live(kline_bars: List[Dict[str, Any]],
         "is_near_high": int(is_near_high),
         "is_reversal": int(is_reversal),
         "any_pattern": int(any_pattern),
+        # v3.2 new patterns (additive — old callers ignore)
+        "is_cup_handle": int(is_cup_handle),
+        "is_stair_step": int(is_stair_step),
+        "is_volume_acceleration": int(is_volume_acceleration),
+        "any_pattern_extended": int(any_pattern_extended),
         "vf_peak_ret": peak_ret,
         "vf_trough_ret": trough_ret,
         "vf_entry_ret": entry_ret,
@@ -3270,22 +3388,32 @@ def detect_vshape_live(kline_bars: List[Dict[str, Any]],
     }
 
 
-def compute_micro_10m_live(swaps: List[Dict], graduation_time: float) -> Dict[str, float]:
-    """Compute microstructure features from raw swaps in first 10 minutes.
+def compute_micro_live(swaps: List[Dict], graduation_time: float,
+                        window_sec: int = 600,
+                        feat_prefix: str = "m10") -> Dict[str, float]:
+    """Compute microstructure features from raw swaps in first `window_sec` seconds.
+
+    Generalized version of `compute_micro_10m_live`. Same logic, parameterized
+    window. Used by both production (T+10m) and Phase 15b training (T+5m).
 
     Args:
         swaps: List of swap dicts with keys: block_time, is_buy, sol_amount, trader_address
         graduation_time: Unix timestamp
+        window_sec: Total feature window (default 600 = 10min). Pass 300 for T+5m.
+        feat_prefix: Feature name prefix (default "m10"). Pass "m5" for T+5m.
 
     Returns:
-        Dict of m10_* features.
+        Dict of {feat_prefix}_* features.
+
+    Byte-parity (Phase 15b 2026-04-26): Training and production MUST pass
+    identical (window_sec, feat_prefix) for the same model to score correctly.
     """
     if not swaps:
         return {}
 
-    # Filter to first 10 minutes
+    # Filter to first window_sec seconds
     early = [s for s in swaps
-             if 0 <= (s.get("block_time", 0) - graduation_time) < 600]
+             if 0 <= (s.get("block_time", 0) - graduation_time) < window_sec]
     if len(early) < 5:
         return {}
 
@@ -3302,15 +3430,18 @@ def compute_micro_10m_live(swaps: List[Dict], graduation_time: float) -> Dict[st
     unique_buyers = len(buyer_addrs)
     unique_sellers = len(seller_addrs)
 
-    # Buyer growth velocity (per 2-minute window)
+    # Buyer growth velocity — split window into 5 sub-windows of equal length
+    sub_window_sec = window_sec // 5  # 120s for 600s window, 60s for 300s window
     seen: set = set()
     growth_windows = []
-    for lo in range(0, 600, 120):
-        w_buys = [s for s in buys if lo <= (s.get("block_time", 0) - graduation_time) < lo + 120]
+    for lo in range(0, window_sec, sub_window_sec):
+        w_buys = [s for s in buys
+                  if lo <= (s.get("block_time", 0) - graduation_time) < lo + sub_window_sec]
         new_addrs = set(s.get("trader_address", "") for s in w_buys) - seen - {""}
         seen.update(new_addrs)
         growth_windows.append(len(new_addrs))
 
+    # Late = last 2 sub-windows; early = first 2 sub-windows
     late_growth = sum(growth_windows[3:]) if len(growth_windows) > 3 else 0
     early_growth = sum(growth_windows[:2]) if len(growth_windows) > 1 else 1
     growth_accel = late_growth / early_growth if early_growth > 0 else 0
@@ -3336,9 +3467,10 @@ def compute_micro_10m_live(swaps: List[Dict], graduation_time: float) -> Dict[st
 
     imbalance = (buy_vol - sell_vol) / total_vol if total_vol > 0 else 0
 
-    # Late imbalance
-    l2_buys = [s for s in buys if (s.get("block_time", 0) - graduation_time) >= 480]
-    l2_sells = [s for s in sells if (s.get("block_time", 0) - graduation_time) >= 480]
+    # Late imbalance — last (4/5) of window onwards (e.g. 480s for 600s, 240s for 300s)
+    late_threshold = window_sec * 4 // 5
+    l2_buys = [s for s in buys if (s.get("block_time", 0) - graduation_time) >= late_threshold]
+    l2_sells = [s for s in sells if (s.get("block_time", 0) - graduation_time) >= late_threshold]
     l2_buy_vol = sum(s.get("sol_amount", 0) for s in l2_buys)
     l2_sell_vol = sum(s.get("sol_amount", 0) for s in l2_sells)
     late_imb = (l2_buy_vol - l2_sell_vol) / (l2_buy_vol + l2_sell_vol) if (l2_buy_vol + l2_sell_vol) > 0 else 0
@@ -3351,19 +3483,131 @@ def compute_micro_10m_live(swaps: List[Dict], graduation_time: float) -> Dict[st
     seller_buyer_ratio = unique_sellers / unique_buyers if unique_buyers > 0 else 0
 
     return {
-        "m10_unique_buyers": unique_buyers,
-        "m10_unique_sellers": unique_sellers,
-        "m10_buyer_hhi": hhi,
-        "m10_top1_buyer_share": top1,
-        "m10_top3_buyer_share": top3,
-        "m10_imbalance": imbalance,
-        "m10_late_imbalance": late_imb,
-        "m10_growth_accel": growth_accel,
-        "m10_wash_ratio": wash,
-        "m10_unique_per_trade": unique_per_trade,
-        "m10_seller_buyer_ratio": seller_buyer_ratio,
-        "m10_buy_vol_total": buy_vol,
-        "m10_sell_vol_frac": sell_vol / total_vol if total_vol > 0 else 0,
+        f"{feat_prefix}_unique_buyers": unique_buyers,
+        f"{feat_prefix}_unique_sellers": unique_sellers,
+        f"{feat_prefix}_buyer_hhi": hhi,
+        f"{feat_prefix}_top1_buyer_share": top1,
+        f"{feat_prefix}_top3_buyer_share": top3,
+        f"{feat_prefix}_imbalance": imbalance,
+        f"{feat_prefix}_late_imbalance": late_imb,
+        f"{feat_prefix}_growth_accel": growth_accel,
+        f"{feat_prefix}_wash_ratio": wash,
+        f"{feat_prefix}_unique_per_trade": unique_per_trade,
+        f"{feat_prefix}_seller_buyer_ratio": seller_buyer_ratio,
+        f"{feat_prefix}_buy_vol_total": buy_vol,
+        f"{feat_prefix}_sell_vol_frac": sell_vol / total_vol if total_vol > 0 else 0,
+    }
+
+
+def compute_micro_10m_live(swaps: List[Dict], graduation_time: float) -> Dict[str, float]:
+    """Backwards-compatible wrapper for T+10min features (m10_* prefix).
+
+    Equivalent to `compute_micro_live(swaps, graduation_time, 600, "m10")`.
+    """
+    return compute_micro_live(swaps, graduation_time, window_sec=600, feat_prefix="m10")
+
+
+def compute_micro_live_full(swaps: List[Dict], graduation_time: float,
+                              anchor_sec: int,
+                              max_anchor_sec: int = 900,
+                              min_anchor_sec: int = 300) -> Dict[str, float]:
+    """Phase 22 v3.1 long-window features (m_full_* prefix).
+
+    Captures cumulative state from graduation to anchor_sec, complementing
+    the rolling 5-min m5_* features computed by `compute_micro_live`. Used
+    by Variant D of v3.1 to give the model BOTH short-term tape (m5) AND
+    long-term context (m_full).
+
+    Args:
+        swaps: list of swap dicts with at least block_time, is_buy, sol_amount,
+               trader_address. Optional: price_sol or effective_price_sol.
+        graduation_time: Unix timestamp of token graduation
+        anchor_sec: scoring anchor offset from grad_t (e.g. 300 = T+5min, 900 = T+15min)
+        max_anchor_sec: max anchor in v3.1 scan range (for normalization, default 900 = T+15min)
+        min_anchor_sec: min anchor (default 300 = T+5min)
+
+    Returns:
+        Dict with 4 features:
+          - m_full_unique_buyers: # distinct buy wallets in [grad_t, anchor]
+          - m_full_price_dist_from_high: (last_px / max_px) - 1, in [-1, 0]
+          - m_full_volume_decay_ratio: vol(last 60s) / max(vol per 60s window),
+                                       in [0, 1]; 0 = trade dying off
+          - m_full_anchor_age_norm: position in scan range, in [0, 1]
+
+    Returns {} if data insufficient (< 5 swaps in window or zero coverage).
+
+    Phase 22 v3.1 spec §3.2 + §13.B audit decisions:
+      - Empty 60s window → volume_decay_ratio = 0 (token dead)
+      - Missing price field → skip price_dist_from_high (return 0)
+    """
+    if not swaps or anchor_sec <= 0:
+        return {}
+
+    # Filter to [grad_t, grad_t + anchor_sec]
+    window_swaps = []
+    for s in swaps:
+        bt = s.get("block_time", 0)
+        if bt is None:
+            continue
+        offset = bt - graduation_time
+        if 0 <= offset < anchor_sec:
+            window_swaps.append((offset, s))
+
+    if len(window_swaps) < 5:
+        return {}
+
+    # Sort by offset (defensive — caller may not pre-sort)
+    window_swaps.sort(key=lambda x: x[0])
+
+    # 1. Unique buyers across full window
+    buyer_addrs = set()
+    for off, s in window_swaps:
+        if s.get("is_buy") and s.get("trader_address"):
+            buyer_addrs.add(s["trader_address"])
+    unique_buyers = len(buyer_addrs)
+
+    # 2. Price dist from high — needs price_sol or effective_price_sol
+    last_px = None
+    max_px = None
+    for off, s in window_swaps:
+        px = s.get("price_sol") or s.get("effective_price_sol")
+        if px is None or px <= 0:
+            continue
+        last_px = float(px)
+        if max_px is None or px > max_px:
+            max_px = float(px)
+    if last_px is not None and max_px is not None and max_px > 0:
+        price_dist_from_high = (last_px / max_px) - 1.0
+    else:
+        price_dist_from_high = 0.0  # missing price data → neutral
+
+    # 3. Volume decay ratio: sum vol in last 60s / max sum vol per 60s window
+    # Bucket window_swaps into 60s bins
+    bin_count = max(1, anchor_sec // 60)
+    vol_bins = [0.0] * bin_count
+    for off, s in window_swaps:
+        bin_idx = int(off // 60)
+        if 0 <= bin_idx < bin_count:
+            vol_bins[bin_idx] += float(s.get("sol_amount") or 0)
+    last_bin_vol = vol_bins[-1]  # last 60s
+    max_bin_vol = max(vol_bins) if vol_bins else 0
+    if max_bin_vol > 0:
+        volume_decay_ratio = last_bin_vol / max_bin_vol
+    else:
+        volume_decay_ratio = 0.0
+
+    # 4. Anchor age normalized — position in scan range [min_anchor, max_anchor]
+    if max_anchor_sec > min_anchor_sec:
+        anchor_age_norm = (anchor_sec - min_anchor_sec) / (max_anchor_sec - min_anchor_sec)
+        anchor_age_norm = max(0.0, min(1.0, anchor_age_norm))  # clip to [0,1]
+    else:
+        anchor_age_norm = 0.0
+
+    return {
+        "m_full_unique_buyers": float(unique_buyers),
+        "m_full_price_dist_from_high": float(price_dist_from_high),
+        "m_full_volume_decay_ratio": float(volume_decay_ratio),
+        "m_full_anchor_age_norm": float(anchor_age_norm),
     }
 
 
@@ -3434,6 +3678,32 @@ class GatewayTrader:
                 "decimals": decimals,
             },
         })
+
+    async def get_loaded_wallets(self, chain: str = "solana") -> List[str]:
+        """GET /wallet/ — list wallet addresses Gateway has private keys for.
+
+        Returns list of addresses for the requested chain (lowercased). Empty
+        list on any error (graceful — caller decides whether to block startup).
+
+        Used for L1 wallet validation (Phase 15a deployment audit F2): verifies
+        config.wallet_address matches Gateway's loaded keystore before trading.
+        Prior incident (2026-04-09): yml drift caused 4 silent buy-500 trades.
+        """
+        try:
+            client = await self._get_client()
+            resp = await client.get(f"{self.gateway_url}/wallet/")
+            if resp.status_code >= 400:
+                return []
+            data = resp.json()
+            # Gateway typical shape: [{"chain": "...", "walletAddresses": ["..."]}, ...]
+            for entry in data if isinstance(data, list) else data.get("wallets", []):
+                if str(entry.get("chain", "")).lower() == chain.lower():
+                    addrs = entry.get("walletAddresses") or entry.get("addresses") or []
+                    return [str(a).lower() for a in addrs]
+            return []
+        except Exception as e:
+            logger.warning(f"get_loaded_wallets failed: {e}")
+            return []
 
     async def get_sol_balance(self) -> Optional[float]:
         """POST /chains/solana/balances — fetch native SOL balance from Gateway."""
@@ -4051,7 +4321,8 @@ class TradeDB:
         entry_tx        TEXT,
         exit_tx         TEXT,
         p_alive         REAL,
-        features        TEXT
+        features        TEXT,
+        entry_source    TEXT DEFAULT ''
     )
     """
 
@@ -4160,8 +4431,36 @@ class TradeDB:
         "ALTER TABLE open_positions ADD COLUMN source TEXT NOT NULL DEFAULT 'chainstack'",
     ]
 
+    # V4: Phase 16.3 — entry_source so a recovered position survives restart
+    # with the strategy attribution intact (used by record_trade on exit).
+    MIGRATE_OPEN_POSITIONS_V4 = [
+        "ALTER TABLE open_positions ADD COLUMN entry_source TEXT DEFAULT ''",
+    ]
+
+    # V5: 2026-05-14 B5 fix — peak_pnl_pct_poll separates the executable peak
+    # (poll-observed) from the stream sandwich-max so trailing drop fires
+    # against prices the bot can actually trade against.
+    MIGRATE_OPEN_POSITIONS_V5 = [
+        "ALTER TABLE open_positions ADD COLUMN peak_pnl_pct_poll REAL NOT NULL DEFAULT 0",
+    ]
+
+    # V6: 2026-05-14 B6 fix — sl_first_breach_ts times the SL dip_confirmed
+    # escape (fire when stalled ≥10s on a dead pool where swap stream is
+    # silent and dip_confirmed can never become True).
+    MIGRATE_OPEN_POSITIONS_V6 = [
+        "ALTER TABLE open_positions ADD COLUMN sl_first_breach_ts REAL",
+    ]
+
     MIGRATE_SWAPS_V2 = [
         "ALTER TABLE swaps ADD COLUMN trader_address TEXT DEFAULT ''",
+    ]
+
+    # Phase 22.D Path B (2026-05-01): tx_hash for Birdeye swap-level alignment.
+    # Historical rows stay '' (only new swaps populated); enables strict join
+    # against Birdeye normalized_swaps.tx_hash for future v3.4 training.
+    MIGRATE_SWAPS_V3 = [
+        "ALTER TABLE swaps ADD COLUMN tx_hash TEXT DEFAULT ''",
+        "CREATE INDEX IF NOT EXISTS idx_swaps_tx_hash ON swaps(tx_hash)",
     ]
 
     MIGRATE_TRADES_V2 = [
@@ -4177,6 +4476,21 @@ class TradeDB:
         "ALTER TABLE trades ADD COLUMN m2_ref_price_sol REAL",
         "ALTER TABLE trades ADD COLUMN preflight_latency_ms INTEGER",
         "ALTER TABLE trades ADD COLUMN pool_liq_at_entry_usd REAL",
+    ]
+
+    # V4: Phase 16.3 entry-source tracking — distinguish big_winner from
+    # vshape so daily reports can compute per-source EV / win rate.
+    MIGRATE_TRADES_V4 = [
+        "ALTER TABLE trades ADD COLUMN entry_source TEXT DEFAULT ''",
+    ]
+
+    # V5: Phase 22.G observability — capacity-aware sizing data.
+    # pool_liq_at_entry_usd already exists (V3); add the SOL-side reserve and
+    # the size-to-pool ratio to enable retrospective slippage calibration
+    # without storing extra data.
+    MIGRATE_TRADES_V5 = [
+        "ALTER TABLE trades ADD COLUMN pool_sol_reserve_at_entry REAL",
+        "ALTER TABLE trades ADD COLUMN slippage_per_pool_ratio REAL",
     ]
 
     MIGRATE_DISCOVERIES_V2 = [
@@ -4291,6 +4605,106 @@ class TradeDB:
         "ALTER TABLE shadow_exit_warn_evals ADD COLUMN p_rug_v4_y120s REAL",
     ]
 
+    # 2026-04-27: Phase 15d v5.2 lean profit-protect ensemble (15 features).
+    # `p_dd_v5` is the deployed ensemble (0.5 * y_dd_60s + 0.5 * y_dd_120s,
+    # both isotonic-calibrated). Per-horizon scores saved for offline analysis.
+    # `v4_fail_reason` captures why predict_14y_v4 returned None when
+    # invoked (P0 audit, 76% NULL rate diagnosis).
+    MIGRATE_SHADOW_EXIT_WARN_EVALS_V6 = [
+        "ALTER TABLE shadow_exit_warn_evals ADD COLUMN p_dd_v5 REAL",
+        "ALTER TABLE shadow_exit_warn_evals ADD COLUMN p_dd_v5_60s REAL",
+        "ALTER TABLE shadow_exit_warn_evals ADD COLUMN p_dd_v5_120s REAL",
+        "ALTER TABLE shadow_exit_warn_evals ADD COLUMN v4_fail_reason TEXT",
+        "ALTER TABLE shadow_exit_warn_evals ADD COLUMN v5_fail_reason TEXT",
+    ]
+
+    # 2026-04-29: Phase 15e v5.3 SHADOW evals (separate table from v5.2's
+    # shadow_exit_warn_evals to avoid blowing it up). v5.3 logs every tick of
+    # every position; would_fire indicates if v5.3 cutoff would fire.
+    DDL_SHADOW_V5_3_EVALS = """
+    CREATE TABLE IF NOT EXISTS shadow_v5_3_evals (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp       REAL    NOT NULL,
+        mint_address    TEXT    NOT NULL,
+        position_id     INTEGER,
+        hold_sec        INTEGER NOT NULL,
+        p_dd_60s        REAL,
+        p_dd_120s       REAL,
+        p_dd_v5_3       REAL,
+        cutoff_value    REAL    NOT NULL,
+        would_fire      INTEGER NOT NULL,
+        pos_pnl_pct     REAL,
+        peak_pnl_pct    REAL,
+        sol_price_usd   REAL,
+        model_version   TEXT DEFAULT 'v5_3',
+        fail_reason     TEXT
+    )
+    """
+
+    DDL_SHADOW_V5_3_EVALS_IDX = [
+        "CREATE INDEX IF NOT EXISTS idx_shadow_v53_mint ON shadow_v5_3_evals(mint_address)",
+        "CREATE INDEX IF NOT EXISTS idx_shadow_v53_pos ON shadow_v5_3_evals(position_id)",
+        "CREATE INDEX IF NOT EXISTS idx_shadow_v53_ts ON shadow_v5_3_evals(timestamp)",
+    ]
+
+    # Phase 15g (2026-05-11) — v5.5.1 Chainstack-native exit model shadow log.
+    # Mirrors shadow_v5_3_evals but for the 12-feature Path C model. Two gates
+    # (raw_cur_pnl ≥ profit_gate, p_dd_v5_5 ≥ cutoff) combine into would_fire.
+    DDL_SHADOW_V5_5_EVALS = """
+    CREATE TABLE IF NOT EXISTS shadow_v5_5_evals (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp       REAL    NOT NULL,
+        mint_address    TEXT    NOT NULL,
+        position_id     INTEGER,
+        hold_sec        INTEGER NOT NULL,
+        p_dd_v5_5       REAL,
+        raw_cur_pnl     REAL,
+        cutoff_value    REAL    NOT NULL,
+        profit_gate     REAL    NOT NULL,
+        would_fire      INTEGER NOT NULL,
+        pos_pnl_pct     REAL,
+        peak_pnl_pct    REAL,
+        sol_price_usd   REAL,
+        model_version   TEXT DEFAULT 'v5_5_1',
+        fail_reason     TEXT
+    )
+    """
+
+    DDL_SHADOW_V5_5_EVALS_IDX = [
+        "CREATE INDEX IF NOT EXISTS idx_shadow_v55_mint ON shadow_v5_5_evals(mint_address)",
+        "CREATE INDEX IF NOT EXISTS idx_shadow_v55_pos ON shadow_v5_5_evals(position_id)",
+        "CREATE INDEX IF NOT EXISTS idx_shadow_v55_ts ON shadow_v5_5_evals(timestamp)",
+    ]
+
+    # v5.5.3 shadow eval table (Phase 15i, 2026-05-11): fragility-clipped 12-feat
+    # model. Same schema as shadow_v5_5_evals + outlier_clips_applied flag.
+    DDL_SHADOW_V5_5_3_EVALS = """
+    CREATE TABLE IF NOT EXISTS shadow_v5_5_3_evals (
+        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp               REAL    NOT NULL,
+        mint_address            TEXT    NOT NULL,
+        position_id             INTEGER,
+        hold_sec                INTEGER NOT NULL,
+        p_dd_v5_5               REAL,
+        raw_cur_pnl             REAL,
+        cutoff_value            REAL    NOT NULL,
+        profit_gate             REAL    NOT NULL,
+        would_fire              INTEGER NOT NULL,
+        pos_pnl_pct             REAL,
+        peak_pnl_pct            REAL,
+        sol_price_usd           REAL,
+        model_version           TEXT DEFAULT 'v5_5_3',
+        fail_reason             TEXT,
+        n_outlier_clips_applied INTEGER DEFAULT 0
+    )
+    """
+
+    DDL_SHADOW_V5_5_3_EVALS_IDX = [
+        "CREATE INDEX IF NOT EXISTS idx_shadow_v553_mint ON shadow_v5_5_3_evals(mint_address)",
+        "CREATE INDEX IF NOT EXISTS idx_shadow_v553_pos ON shadow_v5_5_3_evals(position_id)",
+        "CREATE INDEX IF NOT EXISTS idx_shadow_v553_ts ON shadow_v5_5_3_evals(timestamp)",
+    ]
+
     DDL_TOKEN_OBSERVATIONS = """
     CREATE TABLE IF NOT EXISTS token_observations (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4399,13 +4813,14 @@ class TradeDB:
         "CREATE INDEX IF NOT EXISTS idx_shadow_rug_ts ON shadow_rug_evals(timestamp)",
     ]
 
-    # Rug filter v3 shadow: one row per graduation where v3 scored at T+60s
-    # from bot's own swaps table. decision is REJECT | PASS | SKIP_NO_DATA |
-    # SKIP_MODEL_ERROR. actual_pnl / actual_rug are backfilled by the
-    # resolver once the trade outcome is known, enabling offline
-    # precision/recall analysis without rerunning the feature extractor.
-    DDL_SHADOW_RUG_V3_EVALS = """
-    CREATE TABLE IF NOT EXISTS shadow_rug_filter_v3_evals (
+    # Rug filter v4 shadow (T+5min, 5 features, R1+R4 ensemble): one row per
+    # graduation where v4 scored. decision is REJECT | PASS | SKIP_NO_DATA |
+    # SKIP_MODEL_ERROR. r1_flag / r4_proba record both ensemble parts
+    # separately for ablation; final decision = (r1 OR r4_proba >= cutoff).
+    # actual_pnl / actual_rug backfilled by resolver post-trade.
+    # Spec: model_specs/2026-05-06_rug_filter_v4_CTA_FROZEN_SPEC.md
+    DDL_SHADOW_RUG_V4_EVALS = """
+    CREATE TABLE IF NOT EXISTS shadow_rug_filter_v4_evals (
         id                 INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp          REAL    NOT NULL,
         mint_address       TEXT    NOT NULL,
@@ -4414,11 +4829,11 @@ class TradeDB:
         scored_at_delay_s  REAL,
         window_s           INTEGER,
         n_swaps            INTEGER,
-        v3_score           REAL,
+        r1_flag            INTEGER,
+        r4_proba           REAL,
         cutoff             REAL,
         decision           TEXT,
         reason             TEXT,
-        creator            TEXT,
         features           TEXT,
         model_version      TEXT,
         actual_pnl_usd     REAL,
@@ -4427,10 +4842,43 @@ class TradeDB:
         resolver_ran_at    REAL
     )
     """
-    DDL_SHADOW_RUG_V3_EVALS_IDX = [
-        "CREATE INDEX IF NOT EXISTS idx_shadow_rugv3_mint ON shadow_rug_filter_v3_evals(mint_address)",
-        "CREATE INDEX IF NOT EXISTS idx_shadow_rugv3_ts ON shadow_rug_filter_v3_evals(timestamp)",
-        "CREATE INDEX IF NOT EXISTS idx_shadow_rugv3_grad ON shadow_rug_filter_v3_evals(graduation_time)",
+    DDL_SHADOW_RUG_V4_EVALS_IDX = [
+        "CREATE INDEX IF NOT EXISTS idx_shadow_rugv4_mint ON shadow_rug_filter_v4_evals(mint_address)",
+        "CREATE INDEX IF NOT EXISTS idx_shadow_rugv4_ts ON shadow_rug_filter_v4_evals(timestamp)",
+        "CREATE INDEX IF NOT EXISTS idx_shadow_rugv4_grad ON shadow_rug_filter_v4_evals(graduation_time)",
+    ]
+
+    # Rug filter v4.2 v0.9i hybrid (T+5min, 18 features, RAW XGBoost prob, no LR cal):
+    # one row per graduation where v4.2 scored. decision is REJECT | PASS |
+    # SKIP_NO_DATA | SKIP_MODEL_ERROR. score is raw XGB probability (D-fix).
+    # actual_pnl / actual_rug backfilled by resolver post-trade.
+    # Spec: model_specs/2026-05-08_rug_filter_v4_2_SPEC.md v0.9f section
+    DDL_SHADOW_RUG_V4_2_EVALS = """
+    CREATE TABLE IF NOT EXISTS shadow_rug_filter_v4_2_evals (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp          REAL    NOT NULL,
+        mint_address       TEXT    NOT NULL,
+        symbol             TEXT,
+        graduation_time    REAL,
+        scored_at_delay_s  REAL,
+        window_s           INTEGER,
+        n_swaps            INTEGER,
+        score              REAL,
+        cutoff             REAL,
+        decision           TEXT,
+        reason             TEXT,
+        features           TEXT,
+        model_version      TEXT,
+        actual_pnl_usd     REAL,
+        actual_exit_reason TEXT,
+        actual_rug         INTEGER,
+        resolver_ran_at    REAL
+    )
+    """
+    DDL_SHADOW_RUG_V4_2_EVALS_IDX = [
+        "CREATE INDEX IF NOT EXISTS idx_shadow_rugv4_2_mint ON shadow_rug_filter_v4_2_evals(mint_address)",
+        "CREATE INDEX IF NOT EXISTS idx_shadow_rugv4_2_ts ON shadow_rug_filter_v4_2_evals(timestamp)",
+        "CREATE INDEX IF NOT EXISTS idx_shadow_rugv4_2_grad ON shadow_rug_filter_v4_2_evals(graduation_time)",
     ]
 
     # Phase B shadow: event-triggered first-trigger log. One row per (mint,
@@ -4537,6 +4985,72 @@ class TradeDB:
     DDL_SHADOW_EVENT_INVARIANT_EVALS_IDX = [
         "CREATE INDEX IF NOT EXISTS idx_shadow_ei_mint ON shadow_event_invariant_evals(mint_address)",
         "CREATE INDEX IF NOT EXISTS idx_shadow_ei_ts ON shadow_event_invariant_evals(timestamp)",
+    ]
+
+    # Phase 16.3 big_winner v1 shadow evals — soft top-5% entry filter.
+    # Holdout AUC 0.69, top 5% cutoff 0.7236 → freq 27.8/d, +$1.57/trade,
+    # +$1,309/30d ($10 sizing). 22/22 pre-deploy audit PASS.
+    # Initially shadow-only — promote LIVE after ≥100 triggers with
+    # avg >= +$0.50/trade. Superseded by Phase 24 BigWinner v2 deploy settings.
+    DDL_SHADOW_BIG_WINNER_EVALS = """
+    CREATE TABLE IF NOT EXISTS shadow_big_winner_evals (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp         REAL    NOT NULL,
+        mint_address      TEXT    NOT NULL,
+        symbol            TEXT,
+        graduation_time   REAL,
+        scan_t_sec        INTEGER NOT NULL,
+        cutoff_value      REAL,
+        score             REAL,
+        decision_pass     INTEGER,
+        n_swaps           INTEGER,
+        entry_price_sol   REAL,
+        sol_price_usd     REAL,
+        model_version     TEXT,
+        features_json     TEXT,
+        actual_pnl_usd    REAL,
+        actual_exit_reason TEXT,
+        resolver_ran_at   REAL
+    )
+    """
+    DDL_SHADOW_BIG_WINNER_EVALS_IDX = [
+        "CREATE INDEX IF NOT EXISTS idx_shadow_bw_mint ON shadow_big_winner_evals(mint_address)",
+        "CREATE INDEX IF NOT EXISTS idx_shadow_bw_ts ON shadow_big_winner_evals(timestamp)",
+        "CREATE INDEX IF NOT EXISTS idx_shadow_bw_pass ON shadow_big_winner_evals(decision_pass)",
+    ]
+
+    # Phase 25h (2026-05-03) — V-shape v3.4 entry-side shadow eval log.
+    # M2 evaluation evaluates v3.4 at every scan tick (T+7m..T+15m, 30s
+    # cadence) but only writes to application log on REJECT/PASS. This
+    # table captures EVERY scan tick's score so sim/live alignment audits
+    # can reproduce v3.4 decisions (mirrors shadow_big_winner_evals).
+    DDL_SHADOW_VSHAPE_V3_4_EVALS = """
+    CREATE TABLE IF NOT EXISTS shadow_vshape_v3_4_evals (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp         REAL    NOT NULL,
+        mint_address      TEXT    NOT NULL,
+        symbol            TEXT,
+        graduation_time   REAL,
+        scan_t_sec        INTEGER NOT NULL,
+        cutoff_value      REAL,
+        score             REAL,
+        decision_pass     INTEGER,
+        ood_pass          INTEGER,
+        pattern_detected  INTEGER,
+        n_swaps           INTEGER,
+        entry_price_sol   REAL,
+        sol_price_usd     REAL,
+        model_version     TEXT,
+        features_json     TEXT,
+        actual_pnl_usd    REAL,
+        actual_exit_reason TEXT,
+        resolver_ran_at   REAL
+    )
+    """
+    DDL_SHADOW_VSHAPE_V3_4_EVALS_IDX = [
+        "CREATE INDEX IF NOT EXISTS idx_shadow_vs34_mint ON shadow_vshape_v3_4_evals(mint_address)",
+        "CREATE INDEX IF NOT EXISTS idx_shadow_vs34_ts ON shadow_vshape_v3_4_evals(timestamp)",
+        "CREATE INDEX IF NOT EXISTS idx_shadow_vs34_pass ON shadow_vshape_v3_4_evals(decision_pass)",
     ]
 
     # Forensic dual-price log (BK 2026-04-14 postmortem). Writes one row per
@@ -4649,7 +5163,7 @@ class TradeDB:
                 os.environ.get("PROJECT_DIR", "/home/hummingbot"),
                 "data", "meme_sniper_trades.db")
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        self.db_path = db_path  # exposed for read-only consumers (e.g. rug_filter_v3)
+        self.db_path = db_path  # exposed for read-only consumers (e.g. rug_filter_v4)
         # sqlite3 with check_same_thread=False requires explicit user-side
         # serialization. Without a lock, concurrent controller callbacks can
         # interleave writes on the shared connection and destabilize the file.
@@ -4704,6 +5218,12 @@ class TradeDB:
             self._conn.execute(self.DDL_SHADOW_EVENT_EVALS)
             for idx_stmt in self.DDL_SHADOW_EVENT_EVALS_IDX:
                 self._conn.execute(idx_stmt)
+            self._conn.execute(self.DDL_SHADOW_BIG_WINNER_EVALS)
+            for idx_stmt in self.DDL_SHADOW_BIG_WINNER_EVALS_IDX:
+                self._conn.execute(idx_stmt)
+            self._conn.execute(self.DDL_SHADOW_VSHAPE_V3_4_EVALS)
+            for idx_stmt in self.DDL_SHADOW_VSHAPE_V3_4_EVALS_IDX:
+                self._conn.execute(idx_stmt)
             self._conn.execute(self.DDL_SHADOW_RUG_EVALS)
             for idx_stmt in self.DDL_SHADOW_RUG_EVALS_IDX:
                 self._conn.execute(idx_stmt)
@@ -4713,15 +5233,30 @@ class TradeDB:
             self._conn.execute(self.DDL_SHADOW_SW_V2_EVALS)
             for idx_stmt in self.DDL_SHADOW_SW_V2_EVALS_IDX:
                 self._conn.execute(idx_stmt)
-            self._conn.execute(self.DDL_SHADOW_RUG_V3_EVALS)
-            for idx_stmt in self.DDL_SHADOW_RUG_V3_EVALS_IDX:
+            self._conn.execute(self.DDL_SHADOW_RUG_V4_EVALS)
+            for idx_stmt in self.DDL_SHADOW_RUG_V4_EVALS_IDX:
+                self._conn.execute(idx_stmt)
+            self._conn.execute(self.DDL_SHADOW_RUG_V4_2_EVALS)
+            for idx_stmt in self.DDL_SHADOW_RUG_V4_2_EVALS_IDX:
+                self._conn.execute(idx_stmt)
+            self._conn.execute(self.DDL_SHADOW_V5_3_EVALS)
+            for idx_stmt in self.DDL_SHADOW_V5_3_EVALS_IDX:
+                self._conn.execute(idx_stmt)
+            self._conn.execute(self.DDL_SHADOW_V5_5_EVALS)
+            for idx_stmt in self.DDL_SHADOW_V5_5_EVALS_IDX:
+                self._conn.execute(idx_stmt)
+            self._conn.execute(self.DDL_SHADOW_V5_5_3_EVALS)
+            for idx_stmt in self.DDL_SHADOW_V5_5_3_EVALS_IDX:
                 self._conn.execute(idx_stmt)
             self._migrate_open_positions()
             self._migrate_table("trades", self.MIGRATE_TRADES_V2)
             self._migrate_table("trades", self.MIGRATE_TRADES_V3)
+            self._migrate_table("trades", self.MIGRATE_TRADES_V4)
+            self._migrate_table("trades", self.MIGRATE_TRADES_V5)
             self._migrate_table("discoveries", self.MIGRATE_DISCOVERIES_V2)
             self._migrate_table("token_observations", self.MIGRATE_OBSERVATIONS_V2)
             self._migrate_table("swaps", self.MIGRATE_SWAPS_V2)
+            self._migrate_table("swaps", self.MIGRATE_SWAPS_V3)
             self._migrate_table("token_observations", self.MIGRATE_OBSERVATIONS_V3)
             self._migrate_table("token_observations", self.MIGRATE_OBSERVATIONS_V4)
             self._migrate_table("token_observations", self.MIGRATE_OBSERVATIONS_V5)
@@ -4732,6 +5267,7 @@ class TradeDB:
             self._migrate_table("shadow_exit_warn_evals", self.MIGRATE_SHADOW_EXIT_WARN_EVALS_V3)
             self._migrate_table("shadow_exit_warn_evals", self.MIGRATE_SHADOW_EXIT_WARN_EVALS_V4)
             self._migrate_table("shadow_exit_warn_evals", self.MIGRATE_SHADOW_EXIT_WARN_EVALS_V5)
+            self._migrate_table("shadow_exit_warn_evals", self.MIGRATE_SHADOW_EXIT_WARN_EVALS_V6)
             self._conn.commit()
         self._telemetry_sink: Optional[PostgresTelemetrySink] = None
         telemetry_dsn = os.environ.get("TELEMETRY_DATABASE_URL", "").strip()
@@ -4782,33 +5318,67 @@ class TradeDB:
             self._conn.commit()
 
     def _migrate_open_positions(self):
-        """Add trailing stop columns (v2) and pool_address/source (v3) if missing."""
+        """Add trailing stop columns (v2), pool_address/source (v3),
+        entry_source (v4), peak_pnl_pct_poll (v5), sl_first_breach_ts (v6)
+        if missing."""
         self._migrate_table("open_positions", self.MIGRATE_OPEN_POSITIONS_V2)
         self._migrate_table("open_positions", self.MIGRATE_OPEN_POSITIONS_V3)
+        self._migrate_table("open_positions", self.MIGRATE_OPEN_POSITIONS_V4)
+        self._migrate_table("open_positions", self.MIGRATE_OPEN_POSITIONS_V5)
+        self._migrate_table("open_positions", self.MIGRATE_OPEN_POSITIONS_V6)
 
     def _migrate_table(self, table: str, stmts: list):
-        """Generic migration: add columns if missing."""
+        """Generic migration: add columns and/or auxiliary DDL (indices, etc.) if missing.
+
+        Phase 16.3 Step 3 audit fix: failures used to silently `pass`,
+        which caused INSERT to later reference missing columns and lose
+        rows. Now we log loudly so on-call sees the issue, but we don't
+        crash startup (the table may be locked transiently).
+
+        Phase 22.D Route X bugfix (2026-05-01): handle non-ADD-COLUMN
+        statements (e.g. CREATE INDEX IF NOT EXISTS). Previous parser
+        unconditionally split on "ADD COLUMN " which raised IndexError
+        on any other DDL, killing the entire migration list mid-loop.
+        """
         cols = {row[1] for row in self._fetchall(f"PRAGMA table_info({table})")}
         for stmt in stmts:
-            col_name = stmt.split("ADD COLUMN ")[1].split()[0]
-            if col_name not in cols:
-                try:
-                    with self._lock:
-                        self._conn.execute(stmt)
-                        logger.info(f"TradeDB migration: {table}.{col_name} added")
-                except Exception:
-                    pass
+            if "ADD COLUMN" in stmt:
+                col_name = stmt.split("ADD COLUMN ")[1].split()[0]
+                if col_name in cols:
+                    continue
+                desc = f"{table}.{col_name}"
+            else:
+                # Auxiliary DDL (CREATE INDEX, etc.) — idempotent if it
+                # uses IF NOT EXISTS. We still execute under lock and
+                # log, but don't gate on column-existence.
+                desc = stmt[:80]
+            try:
+                with self._lock:
+                    self._conn.execute(stmt)
+                    logger.info(f"TradeDB migration: {desc} applied")
+            except Exception as e:
+                logger.error(
+                    f"TradeDB migration FAILED: {desc}: {e} "
+                    f"— INSERTs/queries referencing this may fail. "
+                    f"Investigate immediately.")
 
-    def record_trade(self, record: "TradeRecord", features: Optional[Dict] = None):
-        """Insert a completed trade."""
+    def record_trade(self, record: "TradeRecord", features: Optional[Dict] = None,
+                     entry_source: str = ""):
+        """Insert a completed trade.
+
+        Phase 16.3: entry_source distinguishes which model triggered the entry
+        (e.g. "vshape", "big_winner_v2"). Empty string = legacy/unknown.
+        """
         self._execute_commit(
             """INSERT INTO trades
                (timestamp, token_symbol, mint_address, entry_price_sol, exit_price_sol,
                 token_amount, sol_invested, sol_received, pnl_sol, pnl_usd,
                 hold_seconds, exit_reason, entry_tx, exit_tx, p_alive, features,
                 entry_time, peak_pnl_pct, sol_price_usd, trigger_pnl_pct,
-                m2_ref_price_sol, preflight_latency_ms, pool_liq_at_entry_usd)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                m2_ref_price_sol, preflight_latency_ms, pool_liq_at_entry_usd,
+                pool_sol_reserve_at_entry, slippage_per_pool_ratio,
+                entry_source)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (record.timestamp, record.token_symbol, record.mint_address,
              record.entry_price_sol, record.exit_price_sol,
              record.token_amount, record.sol_invested, record.sol_received,
@@ -4818,7 +5388,9 @@ class TradeDB:
              record.entry_time, record.peak_pnl_pct,
              record.sol_price_usd, record.trigger_pnl_pct,
              record.m2_ref_price_sol, record.preflight_latency_ms,
-             record.pool_liq_at_entry_usd))
+             record.pool_liq_at_entry_usd,
+             record.pool_sol_reserve_at_entry, record.slippage_per_pool_ratio,
+             entry_source))
 
     def record_hot_rank_observation(self, mint: str, symbol: str, age_sec: int,
                                      liquidity_usd: float, volume_5m: float,
@@ -4864,57 +5436,185 @@ class TradeDB:
              p_alive, int(passed), reject_reason,
              json.dumps(features) if features else None))
 
+    # In-memory rolling cache of recent prices per mint (perf optimization).
+    # Avoids DB query on every save_swaps call. Phase 22.E Route Y v2.
+    _price_cache_max = 50  # rolling window per mint
+    _price_cache_warmed: Dict[str, bool] = {}
+
+    def _get_price_cache(self, mint_address: str) -> List[float]:
+        """Lazy-init price cache for a mint. First call hits DB once, subsequent
+        calls just append to in-memory list.
+
+        Falls back to empty list if DB unavailable.
+        """
+        cache_attr = "_price_outlier_cache"
+        if not hasattr(self, cache_attr):
+            setattr(self, cache_attr, {})
+        cache = getattr(self, cache_attr)
+
+        if mint_address not in cache:
+            # Lazy DB warmup, only ONCE per mint per process lifetime
+            try:
+                rows = self._fetchall(
+                    "SELECT price_sol FROM swaps WHERE mint_address = ? "
+                    "AND price_sol > 0 ORDER BY timestamp DESC LIMIT 50",
+                    (mint_address,),
+                )
+                cache[mint_address] = [r[0] for r in rows][:50]
+            except Exception:
+                cache[mint_address] = []
+        return cache[mint_address]
+
+    def _filter_price_outliers(self, mint_address: str,
+                                swaps: List["SwapRecord"]) -> List["SwapRecord"]:
+        """Drop swaps whose price_sol is >100x or <0.01x of cached median.
+
+        Phase 22.E Route Y v2 (2026-05-07): use in-memory rolling cache
+        to avoid per-call DB query. Cache lazily warmed from DB on first
+        access per mint. Subsequent calls only update in-memory list.
+
+        Bootstrap (<5 prices): accept all.
+        """
+        if not swaps:
+            return swaps
+
+        cache = self._get_price_cache(mint_address)
+        valid_batch = [s.price_sol for s in swaps if s.price_sol > 0]
+        all_prices = cache + valid_batch
+        if len(all_prices) < 5:
+            # bootstrap: still update cache then accept all
+            cache.extend(valid_batch)
+            if len(cache) > self._price_cache_max:
+                del cache[: len(cache) - self._price_cache_max]
+            return swaps
+
+        sorted_prices = sorted(all_prices)
+        median_price = sorted_prices[len(sorted_prices) // 2]
+        if median_price <= 0:
+            cache.extend(valid_batch)
+            if len(cache) > self._price_cache_max:
+                del cache[: len(cache) - self._price_cache_max]
+            return swaps
+
+        LOW = median_price * 0.01
+        HIGH = median_price * 100.0
+        filtered = []
+        rejected = 0
+        for s in swaps:
+            if s.price_sol <= 0:
+                rejected += 1
+                continue
+            if s.price_sol > HIGH or s.price_sol < LOW:
+                rejected += 1
+                logger.warning(
+                    f"[swap_outlier] reject mint={mint_address[:12]} "
+                    f"price={s.price_sol:.4e} median={median_price:.4e} "
+                    f"ratio={s.price_sol/median_price:.2e}"
+                )
+                continue
+            filtered.append(s)
+
+        # Update cache with accepted prices only
+        cache.extend(s.price_sol for s in filtered)
+        if len(cache) > self._price_cache_max:
+            del cache[: len(cache) - self._price_cache_max]
+
+        if rejected > 0:
+            logger.info(
+                f"[swap_outlier] mint={mint_address[:12]} "
+                f"rejected {rejected}/{len(swaps)} (median={median_price:.4e})"
+            )
+        return filtered
+
     def save_swaps(self, mint_address: str, pool_address: str,
                    swaps: List["SwapRecord"]):
         """Bulk-insert swap records for backtesting analysis.
 
-        Dedup against existing rows: after a bot restart the in-memory
-        kline_builder has no `_seen_sigs` so it would re-fetch swaps that
-        are already in DB. We protect the swaps table from duplicates by
-        querying existing (timestamp, base_amount, is_buy) tuples for this
-        (mint, pool) and only inserting rows whose tuple isn't already
-        present. This is a substitute for a real (mint, pool, signature)
-        UNIQUE index — adding that would require a schema migration.
+        Dedup strategy (Phase 22.D Route X RC3, 2026-05-01):
+          1) Primary: tx_hash (when present on both sides). Two distinct swaps
+             cannot share a tx_hash so this is exact.
+          2) Fallback: (timestamp, base_amount@6sigfig, is_buy) for legacy
+             rows where tx_hash is empty — same as old behavior. The previous
+             single-method dedup squashed genuinely distinct swaps that bots
+             fire with identical (ts, base_amount, direction) (e.g. arb
+             routers split into N identical legs in the same block), losing
+             ~5% of high-volume token data.
+
+        Outlier filter (Phase 22.E Route Y, 2026-05-07):
+          Pre-dedup filter drops price_sol outliers (>100x / <0.01x median).
+          Caused by parser edge-case bugs (decimals mismatch, single-base-
+          unit dust trades). Restored 36% of mints to clean state.
         """
         if not swaps:
             return
         now = time.time()
 
-        # Pull existing fingerprints for this (mint, pool) pair so we can dedup.
-        # Only query when there's a non-trivial number of swaps to save — for
-        # a single new swap the round-trip overhead is small enough to skip.
-        existing: set = set()
+        # Phase 22.E: filter price outliers BEFORE dedup
+        original_count = len(swaps)
+        swaps = self._filter_price_outliers(mint_address, swaps)
+        if len(swaps) < original_count:
+            logger.info(
+                f"save_swaps: outlier filter dropped {original_count - len(swaps)} "
+                f"of {original_count} swaps for {mint_address[:12]}"
+            )
+        if not swaps:
+            return
+
+        # Pull existing fingerprints for this (mint, pool) pair.
+        existing_hashes: set = set()  # tx_hash dedup (primary, exact)
+        existing_tuples: set = set()  # (ts, ba, ib) dedup (fallback)
         try:
-            for ts, ba, ib in self._fetchall(
-                "SELECT timestamp, base_amount, is_buy FROM swaps "
+            for ts, ba, ib, tx in self._fetchall(
+                "SELECT timestamp, base_amount, is_buy, tx_hash FROM swaps "
                 "WHERE mint_address = ? AND pool_address = ?",
                 (mint_address, pool_address),
             ):
-                # Round base_amount to 6 sig figs to avoid float-equality issues
-                existing.add((int(ts), round(float(ba), 6), int(ib)))
+                tx_str = (tx or "").strip() if tx is not None else ""
+                if tx_str:
+                    existing_hashes.add(tx_str)
+                else:
+                    existing_tuples.add((int(ts), round(float(ba), 6), int(ib)))
         except Exception:
-            existing = set()
+            existing_hashes = set()
+            existing_tuples = set()
 
         rows_to_insert = []
         skipped = 0
         for s in swaps:
-            key = (int(s.timestamp), round(float(s.base_amount), 6), int(s.is_buy))
-            if key in existing:
+            sig = (getattr(s, "signature", "") or "").strip()
+            tup_key = (int(s.timestamp), round(float(s.base_amount), 6),
+                       int(s.is_buy))
+            # Primary dedup: tx_hash — exact match means literally same tx
+            if sig and sig in existing_hashes:
                 skipped += 1
                 continue
-            existing.add(key)  # also dedup within the new batch
+            # Fallback dedup: tuple key, but only against rows that ALSO have
+            # no tx_hash. If a candidate has sig but no existing-tx_hash row
+            # collides on tuple, it's a NEW distinct swap (legacy rows didn't
+            # store sig, so collision is ambiguous). Conservative path:
+            # accept it (legacy false-negative dedup is preferred over
+            # losing real swaps).
+            if not sig and tup_key in existing_tuples:
+                skipped += 1
+                continue
+            # Within-batch dedup
+            if sig:
+                existing_hashes.add(sig)
+            else:
+                existing_tuples.add(tup_key)
             rows_to_insert.append(
                 (mint_address, pool_address, s.timestamp, s.price_sol,
                  s.volume_sol, int(s.is_buy), s.base_amount, now,
-                 getattr(s, "trader_address", "") or "")
+                 getattr(s, "trader_address", "") or "",
+                 sig)
             )
 
         if rows_to_insert:
             self._executemany_commit(
                 """INSERT INTO swaps
                    (mint_address, pool_address, timestamp, price_sol, volume_sol,
-                    is_buy, base_amount, collected_at, trader_address)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                    is_buy, base_amount, collected_at, trader_address, tx_hash)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
                 rows_to_insert,
             )
         if skipped:
@@ -5443,18 +6143,52 @@ class TradeDB:
         return None
 
     def get_swaps_for_token(self, mint_address: str) -> List[Dict]:
-        """Return all swaps for a token as list of dicts for micro feature computation."""
+        """Return all swaps for a token as list of dicts for micro feature computation.
+
+        Phase 22 v3.1 (2026-04-29): added `price_sol` and `effective_price_sol`
+        so `compute_micro_live_full` can compute `m_full_price_dist_from_high`
+        with byte-parity to training. Backward compatible — existing callers
+        of `compute_micro_live` ignore the extra fields.
+        """
         rows = self._fetchall(
             """SELECT timestamp as block_time, is_buy, volume_sol as sol_amount,
-                      trader_address
+                      trader_address, price_sol
                FROM swaps
                WHERE mint_address = ?
                ORDER BY timestamp""",
             (mint_address,),
         )
         return [{"block_time": r[0], "is_buy": bool(r[1]),
-                 "sol_amount": r[2], "trader_address": r[3] or ""}
+                 "sol_amount": r[2], "trader_address": r[3] or "",
+                 "price_sol": r[4], "effective_price_sol": r[4]}
                 for r in rows]
+
+    def get_swaps_df_for_token(self, mint_address: str):
+        """Return all swaps for a token as a pandas DataFrame with the FULL
+        schema needed by big_winner inference (compute_all_features +
+        compute_v3_extra_features + compute_phase16_entry_features).
+
+        Phase 16.3: required columns are
+        block_time, trader_address, is_buy, sol_amount, effective_price_sol.
+        """
+        import pandas as pd
+        rows = self._fetchall(
+            """SELECT timestamp as block_time, trader_address, is_buy,
+                      volume_sol as sol_amount, price_sol as effective_price_sol
+               FROM swaps
+               WHERE mint_address = ?
+               ORDER BY timestamp""",
+            (mint_address,),
+        )
+        if not rows:
+            return None
+        df = pd.DataFrame(rows, columns=[
+            "block_time", "trader_address", "is_buy",
+            "sol_amount", "effective_price_sol",
+        ])
+        df["trader_address"] = df["trader_address"].fillna("")
+        df["is_buy"] = df["is_buy"].astype(int)
+        return df
 
     def load_orphan_observations(self, buffer_sec: float = 62 * 60) -> List[Dict]:
         """Return uncompleted observations whose GMGN kline window has elapsed."""
@@ -5579,33 +6313,81 @@ class TradeDB:
              1 if would_reject else 0, model_version,
              json.dumps(features) if features else None))
 
-    def has_shadow_rug_v3_eval(self, mint_address: str) -> bool:
-        """Check if v3 has already scored this mint (idempotency guard)."""
+    def has_shadow_rug_v4_eval(self, mint_address: str) -> bool:
+        """Check if v4 has already scored this mint (idempotency guard)."""
         row = self._fetchall(
-            "SELECT 1 FROM shadow_rug_filter_v3_evals WHERE mint_address = ? LIMIT 1",
+            "SELECT 1 FROM shadow_rug_filter_v4_evals WHERE mint_address = ? LIMIT 1",
             (mint_address,))
         return bool(row)
 
-    def record_shadow_rug_v3_eval(self, *, mint_address: str, symbol: Optional[str],
+    def get_shadow_rug_v4_decision(self, mint_address: str) -> Optional[Tuple[str, Optional[int], Optional[float]]]:
+        """Return (decision, r1_flag, r4_proba) of latest v4 score for mint.
+
+        decision ∈ {"REJECT", "PASS", "SKIP_NO_DATA", "SKIP_MODEL_ERROR"}.
+        Used by future entry gate when rug_v4_gate_enabled is added.
+        """
+        rows = self._fetchall(
+            "SELECT decision, r1_flag, r4_proba FROM shadow_rug_filter_v4_evals "
+            "WHERE mint_address = ? ORDER BY timestamp DESC LIMIT 1",
+            (mint_address,))
+        if not rows:
+            return None
+        decision = str(rows[0][0]) if rows[0][0] is not None else "UNKNOWN"
+        r1_flag = int(rows[0][1]) if rows[0][1] is not None else None
+        r4_proba = float(rows[0][2]) if rows[0][2] is not None else None
+        return (decision, r1_flag, r4_proba)
+
+    def record_shadow_rug_v4_eval(self, *, mint_address: str, symbol: Optional[str],
                                    graduation_time: Optional[float],
                                    scored_at_delay_s: Optional[float],
                                    window_s: int, n_swaps: int,
-                                   score: Optional[float], cutoff: float,
+                                   r1_flag: int, r4_proba: Optional[float],
+                                   cutoff: float,
                                    decision: str, reason: str,
-                                   creator: Optional[str],
                                    features: Optional[Dict],
                                    model_version: Optional[str]):
-        """Log v3 T+60s shadow score (shadow-only, never gates trades)."""
+        """Log v4 T+5min shadow score (shadow-only during validation phase)."""
         self._execute_commit(
-            """INSERT INTO shadow_rug_filter_v3_evals
+            """INSERT INTO shadow_rug_filter_v4_evals
                (timestamp, mint_address, symbol, graduation_time,
-                scored_at_delay_s, window_s, n_swaps, v3_score, cutoff,
-                decision, reason, creator, features, model_version)
+                scored_at_delay_s, window_s, n_swaps, r1_flag, r4_proba,
+                cutoff, decision, reason, features, model_version)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (time.time(), mint_address, symbol, graduation_time,
              scored_at_delay_s, int(window_s), int(n_swaps),
+             int(r1_flag),
+             float(r4_proba) if r4_proba is not None and r4_proba == r4_proba else None,
+             float(cutoff), decision, reason,
+             json.dumps(features) if features else None,
+             model_version))
+
+    # ===== v4.2 v0.9i hybrid shadow methods =====
+    def has_shadow_rug_v4_2_eval(self, mint_address: str) -> bool:
+        rows = self._execute_fetch(
+            "SELECT 1 FROM shadow_rug_filter_v4_2_evals WHERE mint_address = ? LIMIT 1",
+            (mint_address,))
+        return bool(rows)
+
+    def record_shadow_rug_v4_2_eval(self, *, mint_address: str, symbol: Optional[str],
+                                      graduation_time: Optional[float],
+                                      scored_at_delay_s: Optional[float],
+                                      window_s: int, n_swaps: int,
+                                      score: Optional[float],
+                                      cutoff: float,
+                                      decision: str, reason: str,
+                                      features: Optional[Dict],
+                                      model_version: Optional[str]):
+        """Log v4.2 v0.9i hybrid T+5min shadow score (raw XGB probability)."""
+        self._execute_commit(
+            """INSERT INTO shadow_rug_filter_v4_2_evals
+               (timestamp, mint_address, symbol, graduation_time,
+                scored_at_delay_s, window_s, n_swaps, score,
+                cutoff, decision, reason, features, model_version)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (time.time(), mint_address, symbol, graduation_time,
+             scored_at_delay_s, int(window_s), int(n_swaps),
              float(score) if score is not None and score == score else None,
-             float(cutoff), decision, reason, creator,
+             float(cutoff), decision, reason,
              json.dumps(features) if features else None,
              model_version))
 
@@ -5629,6 +6411,61 @@ class TradeDB:
              cutoff_band, cutoff_value, score, pattern, entry_price_sol,
              sol_price_usd, model_version,
              json.dumps(features) if features else None))
+
+    def record_shadow_big_winner_eval(self, *, mint_address: str,
+                                        symbol: Optional[str],
+                                        graduation_time: Optional[float],
+                                        scan_t_sec: int,
+                                        cutoff_value: float,
+                                        score: float,
+                                        decision_pass: bool,
+                                        n_swaps: int,
+                                        entry_price_sol: Optional[float],
+                                        sol_price_usd: Optional[float],
+                                        model_version: str = "big_winner_v2",
+                                        features_json: Optional[str] = None):
+        """Phase 16.3 big_winner v1 shadow eval — one row per scan tick."""
+        self._execute_commit(
+            """INSERT INTO shadow_big_winner_evals
+               (timestamp, mint_address, symbol, graduation_time, scan_t_sec,
+                cutoff_value, score, decision_pass, n_swaps,
+                entry_price_sol, sol_price_usd, model_version, features_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (time.time(), mint_address, symbol, graduation_time, scan_t_sec,
+             cutoff_value, score, int(decision_pass), n_swaps,
+             entry_price_sol, sol_price_usd, model_version, features_json))
+
+    def record_shadow_vshape_v3_4_eval(self, *, mint_address: str,
+                                         symbol: Optional[str],
+                                         graduation_time: Optional[float],
+                                         scan_t_sec: int,
+                                         cutoff_value: float,
+                                         score: float,
+                                         decision_pass: bool,
+                                         ood_pass: Optional[bool] = None,
+                                         pattern_detected: Optional[bool] = None,
+                                         n_swaps: int = 0,
+                                         entry_price_sol: Optional[float] = None,
+                                         sol_price_usd: Optional[float] = None,
+                                         model_version: str = "vshape_v3_4",
+                                         features_json: Optional[str] = None):
+        """Phase 25h V-shape v3.4 shadow eval — one row per scan tick during
+        M2 evaluation. Captures score regardless of pattern_detected /
+        ood_pass / decision_pass so sim/live alignment audit can replay.
+        """
+        self._execute_commit(
+            """INSERT INTO shadow_vshape_v3_4_evals
+               (timestamp, mint_address, symbol, graduation_time, scan_t_sec,
+                cutoff_value, score, decision_pass, ood_pass, pattern_detected,
+                n_swaps, entry_price_sol, sol_price_usd, model_version,
+                features_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (time.time(), mint_address, symbol, graduation_time, scan_t_sec,
+             cutoff_value, score, int(decision_pass),
+             None if ood_pass is None else int(ood_pass),
+             None if pattern_detected is None else int(pattern_detected),
+             n_swaps, entry_price_sol, sol_price_usd, model_version,
+             features_json))
 
     def record_preflight_check(self, *, mint_address: str,
                                symbol: Optional[str], check_name: str,
@@ -5712,6 +6549,100 @@ class TradeDB:
              divergence_pct, price_source, pool_pnl_pct, jup_pnl_pct,
              peak_pnl_pct, 1 if trailing_activated else 0))
 
+    # --- v5.3 shadow eval (Phase 15e, 2026-04-29) -----------------------------
+
+    def record_shadow_v5_3_eval(self, *, mint_address: str,
+                                  position_id: Optional[int],
+                                  hold_sec: int,
+                                  p_dd_60s: Optional[float],
+                                  p_dd_120s: Optional[float],
+                                  p_dd_v5_3: Optional[float],
+                                  cutoff_value: float,
+                                  would_fire: int,
+                                  pos_pnl_pct: Optional[float],
+                                  peak_pnl_pct: Optional[float],
+                                  sol_price_usd: Optional[float],
+                                  fail_reason: Optional[str] = None):
+        """One row per position × decision tick during v5.3 shadow phase.
+        Logged in parallel with v5.2 firing (which actually exits positions).
+        Used post-shadow to compute v5.3 counterfactual PnL.
+        """
+        self._execute_commit(
+            """INSERT INTO shadow_v5_3_evals
+               (timestamp, mint_address, position_id, hold_sec,
+                p_dd_60s, p_dd_120s, p_dd_v5_3, cutoff_value, would_fire,
+                pos_pnl_pct, peak_pnl_pct, sol_price_usd, model_version, fail_reason)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (time.time(), mint_address, position_id, int(hold_sec),
+             p_dd_60s, p_dd_120s, p_dd_v5_3, float(cutoff_value),
+             int(would_fire), pos_pnl_pct, peak_pnl_pct, sol_price_usd,
+             "v5_3", fail_reason),
+        )
+
+    def record_shadow_v5_5_eval(self, *, mint_address: str,
+                                  position_id: Optional[int],
+                                  hold_sec: int,
+                                  p_dd_v5_5: Optional[float],
+                                  raw_cur_pnl: Optional[float],
+                                  cutoff_value: float,
+                                  profit_gate: float,
+                                  would_fire: int,
+                                  pos_pnl_pct: Optional[float],
+                                  peak_pnl_pct: Optional[float],
+                                  sol_price_usd: Optional[float],
+                                  fail_reason: Optional[str] = None):
+        """One row per position × decision tick during v5.5 shadow phase.
+        Logged in parallel with v5.3 firing. would_fire = (raw_cur_pnl ≥ gate)
+        AND (p_dd_v5_5 ≥ cutoff) AND (hold_sec ≥ grace_sec).
+        Used post-shadow for Day-7 cutoff recalib + Path B vs Path C A/B.
+        """
+        self._execute_commit(
+            """INSERT INTO shadow_v5_5_evals
+               (timestamp, mint_address, position_id, hold_sec,
+                p_dd_v5_5, raw_cur_pnl, cutoff_value, profit_gate, would_fire,
+                pos_pnl_pct, peak_pnl_pct, sol_price_usd, model_version, fail_reason)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (time.time(), mint_address, position_id, int(hold_sec),
+             p_dd_v5_5, raw_cur_pnl, float(cutoff_value), float(profit_gate),
+             int(would_fire), pos_pnl_pct, peak_pnl_pct, sol_price_usd,
+             "v5_5_1", fail_reason),
+        )
+
+    def record_shadow_v5_5_3_eval(self, *, mint_address: str,
+                                    position_id: Optional[int],
+                                    hold_sec: int,
+                                    p_dd_v5_5: Optional[float],
+                                    raw_cur_pnl: Optional[float],
+                                    cutoff_value: float,
+                                    profit_gate: float,
+                                    would_fire: int,
+                                    pos_pnl_pct: Optional[float],
+                                    peak_pnl_pct: Optional[float],
+                                    sol_price_usd: Optional[float],
+                                    fail_reason: Optional[str] = None,
+                                    n_outlier_clips_applied: int = 0):
+        """One row per position × decision tick during v5.5.3 shadow phase
+        (Phase 15i 2026-05-11). Parallel to record_shadow_v5_5_eval but for
+        the fragility-clipped + retrained v5.5.3 model.
+
+        Used post-shadow (7d) to A/B vs v5.5.2 LIVE fires:
+          - same decision tick logged in shadow_v5_5_3_evals and (if v5.5.2 enabled)
+            shadow_v5_5_evals
+          - cumulative would_fire PnL comparison → promote/rollback decision
+        """
+        self._execute_commit(
+            """INSERT INTO shadow_v5_5_3_evals
+               (timestamp, mint_address, position_id, hold_sec,
+                p_dd_v5_5, raw_cur_pnl, cutoff_value, profit_gate, would_fire,
+                pos_pnl_pct, peak_pnl_pct, sol_price_usd, model_version, fail_reason,
+                n_outlier_clips_applied)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (time.time(), mint_address, position_id, int(hold_sec),
+             p_dd_v5_5, raw_cur_pnl, float(cutoff_value), float(profit_gate),
+             int(would_fire), pos_pnl_pct, peak_pnl_pct, sol_price_usd,
+             "v5_5_3", fail_reason, int(n_outlier_clips_applied)),
+        )
+
     # --- 14y shadow-exit-warn -------------------------------------------------
 
     def record_shadow_exit_warn_eval(self, *, position_id: Optional[int],
@@ -5730,7 +6661,12 @@ class TradeDB:
                                      p_rug_v3_window: Optional[int] = None,
                                      p_rug_v4: Optional[float] = None,
                                      p_rug_v4_y60s: Optional[float] = None,
-                                     p_rug_v4_y120s: Optional[float] = None):
+                                     p_rug_v4_y120s: Optional[float] = None,
+                                     p_dd_v5: Optional[float] = None,
+                                     p_dd_v5_60s: Optional[float] = None,
+                                     p_dd_v5_120s: Optional[float] = None,
+                                     v4_fail_reason: Optional[str] = None,
+                                     v5_fail_reason: Optional[str] = None):
         """One row per (position, decision_tick) from the 14y multi-model
         inference hook. Resolved asynchronously 60s later.
 
@@ -5742,6 +6678,10 @@ class TradeDB:
         (0.6 × calibrated y_60s + 0.4 × calibrated y_120s) — the deploy signal.
         `p_rug_v4_y60s` / `p_rug_v4_y120s` are the per-horizon calibrated scores
         (saved separately for per-horizon cutoff calibration during shadow).
+        `p_dd_v5` is the v5.2 lean profit-protect ensemble (Phase 15d, 4/27).
+        Per-horizon `p_dd_v5_60s` / `p_dd_v5_120s` saved for offline analysis.
+        `v4_fail_reason` / `v5_fail_reason` capture why predict_* returned None
+        (P0 diagnostic — root-causing high-NULL rates).
         """
         self._execute_commit(
             """INSERT INTO shadow_exit_warn_evals
@@ -5751,14 +6691,18 @@ class TradeDB:
                 n_cache_swaps, feature_window_count,
                 resolved, features_json, p_rug_live_v1, p_rug_v3,
                 p_rug_v3_window,
-                p_rug_v4, p_rug_v4_y60s, p_rug_v4_y120s)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?)""",
+                p_rug_v4, p_rug_v4_y60s, p_rug_v4_y120s,
+                p_dd_v5, p_dd_v5_60s, p_dd_v5_120s,
+                v4_fail_reason, v5_fail_reason)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (time.time(), position_id, mint_address, symbol,
              dt_from_entry, dt_from_grad,
              p_drop_raw, p_rug_raw, mid_price_sol,
              n_cache_swaps, feature_window_count,
              features_json, p_rug_live_v1, p_rug_v3, p_rug_v3_window,
-             p_rug_v4, p_rug_v4_y60s, p_rug_v4_y120s))
+             p_rug_v4, p_rug_v4_y60s, p_rug_v4_y120s,
+             p_dd_v5, p_dd_v5_60s, p_dd_v5_120s,
+             v4_fail_reason, v5_fail_reason))
 
     def fetch_unresolved_shadow_exit_warn_evals(self, older_than_sec: float = 60.0,
                                                 limit: int = 1000) -> list:
@@ -5946,8 +6890,9 @@ class TradeDB:
                (mint_address, symbol, name, decimals, graduation_time,
                 liquidity_usd, price_usd, entry_price_sol, token_amount,
                 entry_time, entry_tx, sol_invested, p_alive, features,
-                peak_pnl_pct, trailing_activated, pool_address, source)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                peak_pnl_pct, trailing_activated, pool_address, source,
+                entry_source, peak_pnl_pct_poll, sl_first_breach_ts)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (pos.token.mint_address, pos.token.symbol, pos.token.name,
              pos.token.decimals, pos.token.graduation_time,
              pos.token.liquidity_usd, pos.token.price_usd,
@@ -5955,7 +6900,10 @@ class TradeDB:
              pos.entry_time, pos.entry_tx, pos.sol_invested,
              pos.model_score, json.dumps(pos.features) if pos.features else None,
              pos.peak_pnl_pct, int(pos.trailing_activated),
-             pos.token.pool_address, getattr(pos.token, "source", "chainstack")))
+             pos.token.pool_address, getattr(pos.token, "source", "chainstack"),
+             getattr(pos, "entry_source", ""),
+             getattr(pos, "peak_pnl_pct_poll", 0.0),
+             getattr(pos, "sl_first_breach_ts", None)))
 
     def remove_position(self, mint_address: str):
         """Remove a closed position from the open_positions table."""
@@ -5968,7 +6916,8 @@ class TradeDB:
             """SELECT mint_address, symbol, name, decimals, graduation_time,
                       liquidity_usd, price_usd, entry_price_sol, token_amount,
                       entry_time, entry_tx, sol_invested, p_alive, features,
-                      peak_pnl_pct, trailing_activated, pool_address, source
+                      peak_pnl_pct, trailing_activated, pool_address, source,
+                      entry_source, peak_pnl_pct_poll, sl_first_breach_ts
                FROM open_positions""")
         positions = []
         for row in rows:
@@ -5990,10 +6939,22 @@ class TradeDB:
                 model_score=row[12] or 0,
                 features=features,
                 peak_pnl_pct=row[14] or 0.0,
+                peak_pnl_pct_poll=row[19] or 0.0,
+                sl_first_breach_ts=row[20],
                 trailing_activated=bool(row[15]),
+                entry_source=row[18] or "",
             )
             positions.append(pos)
         return positions
+
+    def count_trades_by_entry_source(self, entry_source: str) -> int:
+        """Phase 16.3 — count completed trades from a specific entry_source.
+        Used to drive `big_winner_canary_trade_limit` auto-revert.
+        """
+        rows = self._fetchall(
+            "SELECT COUNT(*) FROM trades WHERE entry_source = ?",
+            (entry_source,))
+        return int(rows[0][0]) if rows else 0
 
     def get_recent_stoploss_mints(self, cooldown_sec: float) -> Dict[str, float]:
         """Return {mint_address: blacklist_expiry_ts} for recent stop_loss trades.

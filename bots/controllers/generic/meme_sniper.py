@@ -82,6 +82,15 @@ except Exception:  # pragma: no cover
     RugFilterV4 = None  # type: ignore
     HAS_RUG_FILTER_V4 = False
 
+# v4.2 v0.9i hybrid (drawdown_2min < -55%, raw XGB probability, no LR cal).
+# Spec: model_specs/2026-05-08_rug_filter_v4_2_SPEC.md v0.9f section
+try:
+    from controllers.generic.rug_filter_v4_2 import RugFilterV4_2
+    HAS_RUG_FILTER_V4_2 = True
+except Exception:  # pragma: no cover
+    RugFilterV4_2 = None  # type: ignore
+    HAS_RUG_FILTER_V4_2 = False
+
 try:
     from controllers.generic.geyser_stream import GeyserPumpSwapStream
     HAS_GEYSER = True
@@ -206,20 +215,26 @@ class MemeSniperConfig(ControllerConfigBase):
     token_stoploss_cooldown_sec: float = Field(default=1800.0,
                                                 json_schema_extra={"is_updatable": True})
 
-    # Pre-trade safety filters (legacy model only — P10 has these patterns built-in)
+    # Pre-trade safety filters.
+    # Recalibrated 2026-05-07 (Phase M2-FilterRelax): 14d × 1537 forward sim showed
+    # only `max_5min_return` is a net-positive filter. Other 4 reject groups have
+    # mean PnL +19% to +42% (V-shape rebound population). Relaxed to ≈disabled.
+    # Source: research_notebooks/meme_sniper/p13_statistical_research/outputs/
+    #         filter_recalib/RECOMMENDATION_2026-05-07.md
     max_5min_return: float = Field(default=0.50,
                                    json_schema_extra={"is_updatable": True})
-    max_vol_liq_ratio: float = Field(default=5.0,
+    max_vol_liq_ratio: float = Field(default=10.0,
                                      json_schema_extra={"is_updatable": True})
 
-    # Hard safety floor — applied to ALL models including P10.
-    # Calibrated against training data (9,965 tokens): mean cum_dd=-44.5%, mean cum_ret=-4.6%.
-    # Original -20%/-40% would filter 42%/56% of training data — too aggressive.
-    # These thresholds only catch extreme outliers while preserving model's profitable edge.
-    max_cum_drawdown_at_entry: float = Field(default=0.80,
+    # Disabled-style floors (kept as sanity checks for truly extreme tokens).
+    # Old defaults 0.80 / -0.60 / -0.50 blocked V-shape rebounds (e.g. tokens
+    # that dumped -90% then 80×'d). New defaults only reject near-dead tokens.
+    max_cum_drawdown_at_entry: float = Field(default=0.99,
                                               json_schema_extra={"is_updatable": True})
-    max_entry_return_floor: float = Field(default=-0.60,
+    max_entry_return_floor: float = Field(default=-0.99,
                                            json_schema_extra={"is_updatable": True})
+    lookback_return_floor: float = Field(default=-0.99,
+                                          json_schema_extra={"is_updatable": True})
 
     # Data sources
     gmgn_base_url: str = "https://openapi.gmgn.ai"
@@ -434,6 +449,38 @@ class MemeSniperConfig(ControllerConfigBase):
     v5_3_exit_score_max_age_sec: float = Field(default=60.0,
                                                   json_schema_extra={"is_updatable": True})
 
+    # ─── Phase 15g (2026-05-11) v5.5.1 Chainstack-native exit ─────────────────
+    # 12-feature Path C (drops ps_current_pnl_pct to avoid v5.3-style single-
+    # feature dependency). Bug-fix retrain corrects label/eval-set/PnL bugs.
+    # Phase 3 audit 27/28 PASS. Initial deploy: SHADOW only (logs to
+    # shadow_v5_5_evals; v5.3 still fires). Day-7 cutoff recalib on live dist.
+    # Fire requires BOTH: raw_cur_pnl ≥ profit_gate AND p_dd_v5_5 ≥ cutoff.
+    v5_5_exit_enabled: bool = Field(default=False, json_schema_extra={"is_updatable": True})
+    v5_5_exit_shadow_only: bool = Field(default=True, json_schema_extra={"is_updatable": True})
+    v5_5_exit_cutoff: float = Field(default=0.60, json_schema_extra={"is_updatable": True})
+    v5_5_exit_profit_gate: float = Field(default=0.05, json_schema_extra={"is_updatable": True})
+    v5_5_exit_grace_sec: int = Field(default=30, json_schema_extra={"is_updatable": True})
+    v5_5_exit_score_max_age_sec: float = Field(default=60.0,
+                                                json_schema_extra={"is_updatable": True})
+
+    # v5.5.3 shadow exit (Phase 15i, 2026-05-11): sandwich filter + fragility clips
+    # (Amihud per-swap cap 100, return [-1,5], volatility per-return ±5). Same 12 features
+    # as v5.5.2. Shadow-only at deploy; logs to shadow_v5_5_3_evals for A/B vs v5.5.2 LIVE.
+    v5_5_3_exit_enabled: bool = Field(default=False, json_schema_extra={"is_updatable": True})
+    v5_5_3_exit_shadow_only: bool = Field(default=True, json_schema_extra={"is_updatable": True})
+    v5_5_3_exit_cutoff: float = Field(default=0.35, json_schema_extra={"is_updatable": True})
+    v5_5_3_exit_profit_gate: float = Field(default=0.05, json_schema_extra={"is_updatable": True})
+    v5_5_3_exit_grace_sec: int = Field(default=30, json_schema_extra={"is_updatable": True})
+    v5_5_3_exit_score_max_age_sec: float = Field(default=60.0,
+                                                  json_schema_extra={"is_updatable": True})
+    # Optional peak guard (default 1.0 = disabled). v5.5 Path C has
+    # `ps_peak_pnl_so_far` as a model feature so peak handling is already
+    # baked in — peak_skip is opt-in only if live monitoring shows v5.5
+    # firing prematurely on momentum continuation (mirror v5.3 Phase 25n
+    # finding). Set < 1.0 in yml to enable.
+    v5_5_exit_peak_skip_threshold: float = Field(default=1.0,
+                                                  json_schema_extra={"is_updatable": True})
+
     # Exit-layer hardening (BK postmortem, 2026-04-14)
     # take_profit_pct: hard take-profit. When pool-backed PnL >= this, exit
     # immediately without waiting for trail_drop. Protects against parabolic
@@ -515,9 +562,12 @@ class MemeSniperConfig(ControllerConfigBase):
     shadow_rug_v4_model_path: str = Field(
         default="/home/hummingbot/models/rug_v4_ensemble_balanced.pkl",
         json_schema_extra={"is_updatable": True})
-    # CTA C-balanced cutoff: r4_proba >= 0.65 (frozen). r1 fires on
-    # recovery_attempts_count_300s >= r1_threshold (also frozen in pickle).
-    shadow_rug_v4_cutoff: float = Field(default=0.65,
+    # 2026-05-07 RECALIBRATED to 0.92 (was 0.65).
+    # Spec-frozen 0.65 was calibrated on Birdeye holdout (2.2% rug) → 8.3% flag rate.
+    # On bot cohort (43% rug, post M2+v3.1+v1.6.1 pre-filter), 0.65 reject = 41% (over-aggressive).
+    # Live recalibration on n=106 resolved evals: 0.92 → 25% reject, +$0.21/trade.
+    # R1 retained but is empirically worthless on bot cohort (fires 1.9%, 0/2 hits).
+    shadow_rug_v4_cutoff: float = Field(default=0.92,
                                          json_schema_extra={"is_updatable": True})
     # Window for v4 features: T+0 to T+300s post-graduation.
     shadow_rug_v4_window_sec: int = Field(default=300,
@@ -525,6 +575,25 @@ class MemeSniperConfig(ControllerConfigBase):
     # Minimum swap count to score (training corpus had ≥5 in window; we add buffer)
     shadow_rug_v4_min_swaps: int = Field(default=5,
                                           json_schema_extra={"is_updatable": True})
+
+    # ⭐ Rug filter v4.2 v0.9i hybrid (drawdown_2min < -55%, raw XGB prob, no LR cal)
+    # 18 features (microstructure + counts + macro). Birdeye holdout AUC 0.7024,
+    # production big_loss AUC 0.5573. Top 20% gate catches ~25% big losses.
+    # SHADOW ONLY during validation phase (2026-05-09 onwards).
+    # Spec: model_specs/2026-05-08_rug_filter_v4_2_SPEC.md v0.9f section
+    shadow_rug_v4_2_enabled: bool = Field(default=True,
+                                            json_schema_extra={"is_updatable": True})
+    shadow_rug_v4_2_model_path: str = Field(
+        default="/home/hummingbot/models/rug_v4_2_v0_9i_hybrid.pkl",
+        json_schema_extra={"is_updatable": True})
+    # cutoff = top-20% val_raw threshold (best alignment +2.4pp drift).
+    # See v4_2_v0_9i_hybrid.pkl["cutoffs_raw"] for {top5..top30} options.
+    shadow_rug_v4_2_cutoff: float = Field(default=0.5040,
+                                            json_schema_extra={"is_updatable": True})
+    shadow_rug_v4_2_window_sec: int = Field(default=300,
+                                              json_schema_extra={"is_updatable": True})
+    shadow_rug_v4_2_min_swaps: int = Field(default=10,
+                                             json_schema_extra={"is_updatable": True})
 
     # Phase B shadow: event-triggered entry scanner (research artifact).
     # Scans T+3m..T+15m, records hypothetical first-trigger entries to
@@ -577,6 +646,20 @@ class MemeSniperConfig(ControllerConfigBase):
                                                   json_schema_extra={"is_updatable": True})
     simple_t5m_entry_source: str = Field(default="simple_t5m",
                                            json_schema_extra={"is_updatable": True})
+    # B7 fix (2026-05-09): non-negative slope pre-filter.
+    # Live audit found 53% (202/380) of trades had peak <= 0 — many entered
+    # while token was in active dump. Reject if slope in last 60s before
+    # T+5m entry < -5%. Default OFF for shadow validation; enable via yml.
+    simple_t5m_min_slope_enabled: bool = Field(default=True,
+                                                  json_schema_extra={"is_updatable": True})
+    simple_t5m_min_slope_pct: float = Field(default=-0.05,
+                                              json_schema_extra={"is_updatable": True})
+    # B8 fix (2026-05-09): max_slope upper cap — reject if pump too steep.
+    # Audit (n=87 24h trades): 27% of big_losers had slope > +20% (pump-dump
+    # trap) vs winners' p75 = only +6.6%. +20% cap → catches 27% of big losses
+    # (11/41), 18% winner false-positive (2/11), net +$5.70/24h at $1 sizing.
+    simple_t5m_max_slope_pct: float = Field(default=0.20,
+                                              json_schema_extra={"is_updatable": True})
 
     # Phase 24 BigWinner v2 entry-side filter.
     # Canonical fields use big_winner_*; big_winner_v1_* remains as a
@@ -941,6 +1024,33 @@ class MemeSniper(ControllerBase):
                 logger.warning(
                     f"RugFilterV4 path not found: {config.shadow_rug_v4_model_path} "
                     "— v4 shadow scorer disabled"
+                )
+
+        # Rug filter v4.2 v0.9i hybrid (T+5m, 18 features, raw XGB probability)
+        # Spec: model_specs/2026-05-08_rug_filter_v4_2_SPEC.md v0.9f
+        self.rug_filter_v4_2_model = None
+        if config.shadow_rug_v4_2_enabled and HAS_RUG_FILTER_V4_2:
+            if config.shadow_rug_v4_2_model_path and os.path.exists(config.shadow_rug_v4_2_model_path):
+                try:
+                    self.rug_filter_v4_2_model = RugFilterV4_2(
+                        model_path=config.shadow_rug_v4_2_model_path,
+                        cutoff=config.shadow_rug_v4_2_cutoff,
+                        window_s=config.shadow_rug_v4_2_window_sec,
+                        min_swaps=config.shadow_rug_v4_2_min_swaps,
+                    )
+                    logger.info(
+                        f"RugFilterV4_2 loaded (v0.9i hybrid raw): "
+                        f"cutoff={config.shadow_rug_v4_2_cutoff:.4f} "
+                        f"window={config.shadow_rug_v4_2_window_sec}s "
+                        f"min_swaps={config.shadow_rug_v4_2_min_swaps}"
+                    )
+                except Exception as e:
+                    logger.error(f"RugFilterV4_2 load failed: {e}")
+                    self.rug_filter_v4_2_model = None
+            else:
+                logger.warning(
+                    f"RugFilterV4_2 path not found: {config.shadow_rug_v4_2_model_path} "
+                    "— v4.2 shadow scorer disabled"
                 )
 
         # Phase B event-triggered scanner (shadow only)
@@ -1594,6 +1704,56 @@ class MemeSniper(ControllerBase):
                         f"M2 safety: {reject_reason}")
                     self._add_to_observation_pool(
                         token, 0.0, False, f"simple_t5m_m2_{reject_reason}")
+                    continue
+
+                # B7 fix (2026-05-09): non-negative slope pre-filter.
+                # Live audit found 53% of trades had peak_pnl_pct ≤ 0
+                # (never went up). Reject entries where price slope in last
+                # 60s is < -5% — these tokens are already in active dump.
+                stream = getattr(self, "_grpc_stream", None)
+                slope_ok = True
+                slope_pct = None
+                if (self.config.simple_t5m_min_slope_enabled
+                        and stream is not None):
+                    try:
+                        records = stream.get_recent_swap_records(
+                            token.mint_address, max_age_sec=60.0)
+                        if records and len(records) >= 5:
+                            # Sort by ts to be safe
+                            recs_sorted = sorted(records, key=lambda r: r.timestamp)
+                            # Use median of first 3 vs median of last 3 to avoid
+                            # single-tick spike/dip distortion
+                            from statistics import median
+                            first_med = median(r.price_sol for r in recs_sorted[:3])
+                            last_med = median(r.price_sol for r in recs_sorted[-3:])
+                            if first_med > 0:
+                                slope_pct = (last_med - first_med) / first_med
+                                lo = float(self.config.simple_t5m_min_slope_pct)
+                                hi = float(self.config.simple_t5m_max_slope_pct)
+                                if slope_pct < lo:
+                                    slope_ok = False
+                                    slope_reject_reason = "active_dump"
+                                elif slope_pct > hi:
+                                    # B8 fix: pump too steep → likely pump-dump trap
+                                    slope_ok = False
+                                    slope_reject_reason = "pump_top"
+                    except Exception as e_slope:
+                        logger.debug(
+                            f"SIMPLE-T5M: {token.symbol} slope check failed: {e_slope} — allow")
+                if not slope_ok:
+                    reason = locals().get("slope_reject_reason", "active_dump")
+                    if reason == "active_dump":
+                        msg = (f"slope_60s={slope_pct*100:+.1f}% < "
+                               f"{self.config.simple_t5m_min_slope_pct*100:+.1f}% "
+                               f"(token actively dumping)")
+                    else:  # pump_top
+                        msg = (f"slope_60s={slope_pct*100:+.1f}% > "
+                               f"+{self.config.simple_t5m_max_slope_pct*100:.0f}% "
+                               f"(pump-dump trap)")
+                    logger.info(f"SIMPLE-T5M: {token.symbol} REJECT — {msg}")
+                    self._add_to_observation_pool(
+                        token, 0.0, False,
+                        f"simple_t5m_slope_{reason}_{slope_pct*100:+.0f}pct")
                     continue
 
                 # PASS — enqueue
@@ -2253,6 +2413,7 @@ class MemeSniper(ControllerBase):
         await self._run_shadow_event()
         await self._run_shadow_event_invariant()
         await self._run_shadow_rug_filter_v4()
+        await self._run_shadow_rug_filter_v4_2()
         await self._run_shadow_big_winner()
 
         # Update SOL price for USD conversion (every 60s)
@@ -4563,6 +4724,29 @@ class MemeSniper(ControllerBase):
                 if not fire_reason:
                     continue
 
+                # B6 fix (2026-05-09): require dip confirmation. The single
+                # event triggering this path could be a transient sandwich
+                # tick (audit: 87% of SL exits recovered >30% within 10min).
+                # For SL/EC, require ≥3 swaps in last 5s confirming the dip.
+                # Note: this gate runs in BOTH shadow and live modes so the
+                # shadow log accurately reflects what live would do.
+                stream = getattr(self, "_grpc_stream", None)
+                if stream is not None and hasattr(stream, "is_dip_confirmed"):
+                    threshold_pct = (-self.config.stop_loss_pct
+                                      if fire_reason == "stop_loss"
+                                      else -self.config.vshape_early_crash_pct)
+                    try:
+                        if not stream.is_dip_confirmed(
+                                mint, float(pos.entry_price_sol),
+                                threshold_pct,
+                                window_sec=5.0, min_confirmations=3):
+                            logger.debug(
+                                f"M4 [GRPC-{fire_reason.upper()}]: {pos.token.symbol} "
+                                f"DIP_NOT_CONFIRMED pnl={pnl_pct*100:+.1f}% — defer")
+                            continue  # transient — wait for confirmation
+                    except Exception:
+                        pass  # safety: any error → preserve old behavior
+
                 # Shadow mode: log only
                 if self.config.grpc_event_exit_shadow_only:
                     logger.info(
@@ -4631,10 +4815,39 @@ class MemeSniper(ControllerBase):
                         f"grace={self.config.v5_3_exit_grace_sec}s")
                 except Exception as e_v5_3:
                     logger.warning(f"v5.3 model not loaded: {e_v5_3}")
+            # v5.5.2 sandwich-filtered Chainstack-native 12-feat (Phase 15h, 2026-05-11)
+            v5_5_ok = False
+            if self.config.v5_5_exit_enabled:
+                try:
+                    mdl.load_14y_v5_5_2()
+                    v5_5_ok = True
+                    logger.info(
+                        f"v5.5.2 exit model loaded (sandwich-filtered): "
+                        f"cutoff={self.config.v5_5_exit_cutoff}, "
+                        f"profit_gate={self.config.v5_5_exit_profit_gate}, "
+                        f"shadow_only={self.config.v5_5_exit_shadow_only}, "
+                        f"grace={self.config.v5_5_exit_grace_sec}s")
+                except Exception as e_v5_5:
+                    logger.warning(f"v5.5.2 model not loaded: {e_v5_5}")
+            # v5.5.3 sandwich-filtered + fragility-clipped 12-feat (Phase 15i, 2026-05-11)
+            v5_5_3_ok = False
+            if self.config.v5_5_3_exit_enabled:
+                try:
+                    mdl.load_14y_v5_5_3()
+                    v5_5_3_ok = True
+                    logger.info(
+                        f"v5.5.3 exit model loaded (sandwich + fragility clips): "
+                        f"cutoff={self.config.v5_5_3_exit_cutoff}, "
+                        f"profit_gate={self.config.v5_5_3_exit_profit_gate}, "
+                        f"shadow_only={self.config.v5_5_3_exit_shadow_only}, "
+                        f"grace={self.config.v5_5_3_exit_grace_sec}s")
+                except Exception as e_v5_5_3:
+                    logger.warning(f"v5.5.3 model not loaded: {e_v5_5_3}")
             logger.info("14y: exit-warn models loaded "
                         f"(Tier B + F2a+HC + live_v1={'yes' if live_v1_ok else 'no'}"
                         f" + v3={'yes' if v3_ok else 'no'}"
-                        f" + v5_3={'yes' if v5_3_ok else 'no'})")
+                        f" + v5_3={'yes' if v5_3_ok else 'no'}"
+                        f" + v5_5={'yes' if v5_5_ok else 'no'})")
         except Exception as e:
             logger.error(f"14y: failed to load exit-warn models: {e}",
                          exc_info=True)
@@ -4880,6 +5093,147 @@ class MemeSniper(ControllerBase):
                     )
                 except Exception as e_log:
                     logger.debug(f"v5.3 shadow log failed for {mint[:10]}: {e_log}")
+
+            # ─── v5.5.1 Chainstack-native 12-feat (Phase 15g, 2026-05-11) ───
+            # Path C 12-feat model. Bug-fix retrain (BUG-1/2/3 corrected).
+            # Phase 3 audit 27/28 PASS. Shadow-only by default — logs every
+            # tick to shadow_v5_5_evals for Day-7 cutoff recalib + counterfactual
+            # PnL comparison vs live v5.3 fires.
+            p_dd_v5_5: Optional[float] = None
+            raw_cur_pnl_v5_5: Optional[float] = None
+            v5_5_fail_reason: Optional[str] = None
+            if self.config.v5_5_exit_enabled:
+                try:
+                    # v5.5.2 (Phase 15h, 2026-05-11): sandwich-filtered features.
+                    # Replaces v5.5.1's vulnerable last-raw-swap reads. Same 12
+                    # features, same API, but swap stream is cleaned (window=30,
+                    # max_ratio=3.0) before feature compute.
+                    v5_5_out = mdl.predict_14y_v5_5_2(
+                        df, float(t), float(grad_time),
+                        entry_time=float(pos.entry_time),
+                        entry_price=float(pos.entry_price_sol),
+                    )
+                    if v5_5_out is not None:
+                        p_dd_v5_5 = float(v5_5_out["p_dd_v5_5"])
+                        raw_cur_pnl_v5_5 = float(v5_5_out["raw_cur_pnl"])
+                        pos.last_v5_5_score = {
+                            "p_dd_v5_5": p_dd_v5_5,
+                            "raw_cur_pnl": raw_cur_pnl_v5_5,
+                        }
+                        pos.last_v5_5_score_t = float(now)
+                    else:
+                        if float(pos.entry_price_sol) <= 0:
+                            v5_5_fail_reason = "entry_price_le_zero"
+                        elif t < int(pos.entry_time):
+                            v5_5_fail_reason = "t_before_entry"
+                        else:
+                            v5_5_fail_reason = "feature_compute_none"
+                except Exception as e_v55:
+                    v5_5_fail_reason = f"exc:{type(e_v55).__name__}:{str(e_v55)[:80]}"
+                    logger.debug(f"v5.5 score failed for {mint[:10]}: {e_v55}")
+
+                try:
+                    cutoff_v55 = float(self.config.v5_5_exit_cutoff)
+                    profit_gate_v55 = float(self.config.v5_5_exit_profit_gate)
+                    hold_s_v55 = int(now - pos.entry_time)
+                    would_fire_v55 = int(
+                        p_dd_v5_5 is not None
+                        and raw_cur_pnl_v5_5 is not None
+                        and raw_cur_pnl_v5_5 >= profit_gate_v55
+                        and p_dd_v5_5 >= cutoff_v55
+                        and hold_s_v55 >= int(self.config.v5_5_exit_grace_sec)
+                    )
+                    cur_pnl_v55: Optional[float] = None
+                    try:
+                        last_px_v55 = float(df["effective_price_sol"].iloc[-1])
+                        ep_v55 = float(pos.entry_price_sol)
+                        if last_px_v55 > 0 and ep_v55 > 0:
+                            cur_pnl_v55 = (last_px_v55 - ep_v55) / ep_v55
+                    except Exception:
+                        cur_pnl_v55 = None
+                    self.db.record_shadow_v5_5_eval(
+                        mint_address=mint,
+                        position_id=None,
+                        hold_sec=hold_s_v55,
+                        p_dd_v5_5=p_dd_v5_5,
+                        raw_cur_pnl=raw_cur_pnl_v5_5,
+                        cutoff_value=cutoff_v55,
+                        profit_gate=profit_gate_v55,
+                        would_fire=would_fire_v55,
+                        pos_pnl_pct=cur_pnl_v55,
+                        peak_pnl_pct=float(pos.peak_pnl_pct),
+                        sol_price_usd=self._sol_price_usd if self._sol_price_usd > 0 else None,
+                        fail_reason=v5_5_fail_reason,
+                    )
+                except Exception as e_log_v55:
+                    logger.debug(f"v5.5 shadow log failed for {mint[:10]}: {e_log_v55}")
+
+            # ─── v5.5.3 fragility-clipped 12-feat (Phase 15i, 2026-05-11) ───
+            # Sandwich filter + per-swap clip on Amihud / return / volatility.
+            # Same 12 features as v5.5.2 but trained on clipped panel + applies
+            # training-time p99 outlier clips at inference (helper in exit_models).
+            # Shadow-only at deploy → logs to shadow_v5_5_3_evals for 7-day A/B
+            # vs v5.5.2 LIVE fires. Active fire path not wired (cutoff to add
+            # when promoting; shadow-only=false will be gated then).
+            p_dd_v5_5_3: Optional[float] = None
+            raw_cur_pnl_v5_5_3: Optional[float] = None
+            v5_5_3_fail_reason: Optional[str] = None
+            if self.config.v5_5_3_exit_enabled:
+                try:
+                    v5_5_3_out = mdl.predict_14y_v5_5_3(
+                        df, float(t), float(grad_time),
+                        entry_time=float(pos.entry_time),
+                        entry_price=float(pos.entry_price_sol),
+                    )
+                    if v5_5_3_out is not None:
+                        p_dd_v5_5_3 = float(v5_5_3_out["p_dd_v5_5"])
+                        raw_cur_pnl_v5_5_3 = float(v5_5_3_out["raw_cur_pnl"])
+                    else:
+                        if float(pos.entry_price_sol) <= 0:
+                            v5_5_3_fail_reason = "entry_price_le_zero"
+                        elif t < int(pos.entry_time):
+                            v5_5_3_fail_reason = "t_before_entry"
+                        else:
+                            v5_5_3_fail_reason = "feature_compute_none"
+                except Exception as e_v553:
+                    v5_5_3_fail_reason = f"exc:{type(e_v553).__name__}:{str(e_v553)[:80]}"
+                    logger.debug(f"v5.5.3 score failed for {mint[:10]}: {e_v553}")
+
+                try:
+                    cutoff_v553 = float(self.config.v5_5_3_exit_cutoff)
+                    profit_gate_v553 = float(self.config.v5_5_3_exit_profit_gate)
+                    hold_s_v553 = int(now - pos.entry_time)
+                    would_fire_v553 = int(
+                        p_dd_v5_5_3 is not None
+                        and raw_cur_pnl_v5_5_3 is not None
+                        and raw_cur_pnl_v5_5_3 >= profit_gate_v553
+                        and p_dd_v5_5_3 >= cutoff_v553
+                        and hold_s_v553 >= int(self.config.v5_5_3_exit_grace_sec)
+                    )
+                    cur_pnl_v553: Optional[float] = None
+                    try:
+                        last_px_v553 = float(df["effective_price_sol"].iloc[-1])
+                        ep_v553 = float(pos.entry_price_sol)
+                        if last_px_v553 > 0 and ep_v553 > 0:
+                            cur_pnl_v553 = (last_px_v553 - ep_v553) / ep_v553
+                    except Exception:
+                        cur_pnl_v553 = None
+                    self.db.record_shadow_v5_5_3_eval(
+                        mint_address=mint,
+                        position_id=None,
+                        hold_sec=hold_s_v553,
+                        p_dd_v5_5=p_dd_v5_5_3,
+                        raw_cur_pnl=raw_cur_pnl_v5_5_3,
+                        cutoff_value=cutoff_v553,
+                        profit_gate=profit_gate_v553,
+                        would_fire=would_fire_v553,
+                        pos_pnl_pct=cur_pnl_v553,
+                        peak_pnl_pct=float(pos.peak_pnl_pct),
+                        sol_price_usd=self._sol_price_usd if self._sol_price_usd > 0 else None,
+                        fail_reason=v5_5_3_fail_reason,
+                    )
+                except Exception as e_log_v553:
+                    logger.debug(f"v5.5.3 shadow log failed for {mint[:10]}: {e_log_v553}")
 
             # Smoothed mid = last swap's effective_price_sol (5-swap rolling
             # median already applied internally to feature compute; approximate
@@ -5559,6 +5913,77 @@ class MemeSniper(ControllerBase):
                 )
                 obs._rug_v4_scored = True  # don't retry on hard errors
 
+    async def _run_shadow_rug_filter_v4_2(self):
+        """T+5min shadow scoring for v4.2 v0.9i hybrid (raw XGB prob).
+
+        SHADOW ONLY — does NOT change buy/sell decisions.
+        Logs to `shadow_rug_filter_v4_2_evals` for offline analysis.
+
+        Spec: model_specs/2026-05-08_rug_filter_v4_2_SPEC.md v0.9f
+        """
+        if self.rug_filter_v4_2_model is None:
+            return
+        if not self.config.shadow_rug_v4_2_enabled:
+            return
+        window_s = int(self.config.shadow_rug_v4_2_window_sec)
+        now = time.time()
+        for mint, obs in list(self._observation_pool.items()):
+            grad_t = obs.token.graduation_time
+            elapsed = now - grad_t
+            if elapsed < window_s + 5:
+                continue
+            if getattr(obs, "_rug_v4_2_scored", False):
+                continue
+            # Idempotency: skip if already in DB from a previous restart
+            try:
+                if self.db.has_shadow_rug_v4_2_eval(mint):
+                    obs._rug_v4_2_scored = True
+                    continue
+            except Exception:
+                pass
+            try:
+                db_path = self.db.db_path if hasattr(self.db, "db_path") else None
+                if not db_path:
+                    break
+                # Force in-memory swaps to DB before scoring (matches v4 pattern)
+                try:
+                    self._flush_swaps_to_db(mint, unregister=False)
+                except Exception as _flush_err:
+                    logger.debug(f"v4.2 pre-score flush failed: {_flush_err}")
+                result = self.rug_filter_v4_2_model.score_from_sqlite(
+                    db_path=db_path,
+                    mint_address=mint,
+                    graduation_time=grad_t,
+                )
+                self.db.record_shadow_rug_v4_2_eval(
+                    mint_address=mint,
+                    symbol=obs.token.symbol,
+                    graduation_time=grad_t,
+                    scored_at_delay_s=elapsed,
+                    window_s=window_s,
+                    n_swaps=result.n_swaps,
+                    score=(None if result.score != result.score
+                            else result.score),
+                    cutoff=self.rug_filter_v4_2_model.cutoff,
+                    decision=result.decision,
+                    reason=result.reason,
+                    features=result.features or None,
+                    model_version=self.rug_filter_v4_2_model.VERSION,
+                )
+                score_s = (f"{result.score:.4f}"
+                            if result.score == result.score else "NaN")
+                logger.info(
+                    f"RUG-V4_2-SHADOW: {obs.token.symbol} "
+                    f"score={score_s} cutoff={self.rug_filter_v4_2_model.cutoff:.4f} "
+                    f"n_swaps={result.n_swaps} decision={result.decision}"
+                )
+                obs._rug_v4_2_scored = True
+            except Exception as e:
+                logger.debug(
+                    f"RUG-V4_2-SHADOW: {obs.token.symbol} scoring failed: {e}"
+                )
+                obs._rug_v4_2_scored = True
+
     async def _recover_observations(self):
         """Reload all pending observations from DB into memory, then sweep expired ones."""
         pending = self.db.load_pending_observations()
@@ -6213,8 +6638,10 @@ class MemeSniper(ControllerBase):
                 logger.warning(f"M3: [BUY BLOCKED] {token.symbol} — {reason}")
                 _cancel_quote()
                 return False, None, reason, {}
-            if lb_ret < -0.50:
-                reason = f"lookback_return={lb_ret:.3f}<-0.50 (>50% drop in last 3 bars at M3)"
+            if lb_ret < self.config.lookback_return_floor:
+                reason = (f"lookback_return={lb_ret:.3f}<"
+                          f"{self.config.lookback_return_floor} "
+                          f"(>50% drop in last 3 bars at M3)")
                 logger.warning(f"M3: [BUY BLOCKED] {token.symbol} — {reason}")
                 _cancel_quote()
                 return False, None, reason, {}
@@ -6421,9 +6848,16 @@ class MemeSniper(ControllerBase):
             old_beta = beta
             beta = max(0.0001, min(beta, 0.05))
             clamp_warn.append(f"β {old_beta}→{beta}")
-        if min_usd < 1.0:
-            clamp_warn.append(f"min ${min_usd}→$1.00 (floor)")
-            min_usd = 1.0
+        # 2026-05-11: lowered hard floor 1.0 → 0.05 for canary/validation
+        # mode. $0.05 = ~0.0005 SOL ≈ 50× Solana tx fee margin (well above
+        # dust). Original $1.00 floor silently overrode user yml configs
+        # < $1 (e.g. sizing_min_usd=0.1 → forced to 1.0) — caught when v5.5
+        # canary at $0.10 actually traded at $1. Keep floor non-zero so
+        # accidental yml typos don't trigger dust-tier swap failures.
+        DUST_FLOOR_USD = 0.05
+        if min_usd < DUST_FLOOR_USD:
+            clamp_warn.append(f"min ${min_usd}→${DUST_FLOOR_USD:.2f} (floor)")
+            min_usd = DUST_FLOOR_USD
         if max_usd < min_usd:
             clamp_warn.append(f"max ${max_usd}<min — set max=min=${min_usd}")
             max_usd = min_usd
@@ -6589,7 +7023,13 @@ class MemeSniper(ControllerBase):
                                      f"BUY ZERO TOKENS {token.symbol} tx={tx_hash}")
                 return False
 
-            swap_entry_price = actual_sol_spent / token_amount
+            # Use the intended swap amount (sol_amount) for price, not
+            # actual_sol_spent which includes priority fees.  Priority fees
+            # are a committed cost already captured in sol_invested / pnl_sol,
+            # but inflating entry_price_sol by 2-3× causes pnl_pct to read
+            # ~-68% immediately, which fires EC EMERGENCY on every trade.
+            fee_overhead_sol = actual_sol_spent - sol_amount
+            swap_entry_price = sol_amount / token_amount
 
             # Calibrate entry_price using the same source as M4 monitoring
             # (batch API mid-price), so stop-loss isn't triggered by buy slippage.
@@ -6692,7 +7132,8 @@ class MemeSniper(ControllerBase):
                 fill_vs_decision_mid_pct=fill_vs_decision_mid_pct)
 
             logger.info(f"M3: [BUY OK] {token_amount:.0f} {token.symbol} @ {entry_price:.10f} SOL/token "
-                        f"| invested={actual_sol_spent:.4f} SOL | tx={tx_hash}")
+                        f"| swap={sol_amount:.4f} SOL fee_overhead={fee_overhead_sol:.5f} SOL"
+                        f" total={actual_sol_spent:.4f} SOL | tx={tx_hash}")
             self.db.record_event("INFO", "buy",
                                  f"BUY {token.symbol} qty={token_amount:.0f} sol={actual_sol_spent:.4f} tx={tx_hash}")
             return True
@@ -6908,6 +7349,38 @@ class MemeSniper(ControllerBase):
                     and hold_sec < self.config.vshape_early_crash_window_sec
                     and pnl_pct <= -self.config.vshape_early_crash_pct
                     and pos.peak_pnl_pct <= 0):
+                # B6 fix (2026-05-09): require dip confirmation to defend
+                # against single-tick sandwich spikes.
+                # B6.1 fix (2026-05-12): bypass dip_confirmed when token is
+                # clearly dead (pnl <= -50%). Audit revealed 8,194 DIP_NOT_CONFIRMED
+                # log entries blocking fires on -70% to -99% tokens whose pools
+                # had no swap stream activity → no confirmations possible →
+                # SL/EC silently deferred → tokens held to 30min time_limit at
+                # ~99% loss. 56% of 24h trades hit time_limit due to this.
+                EMERGENCY_BYPASS_PNL = 0.50  # -50%: token clearly dead, fire regardless
+                stream = getattr(self, "_grpc_stream", None)
+                ec_confirmed = True
+                if pnl_pct > -EMERGENCY_BYPASS_PNL:
+                    # Normal flow: require dip confirmation
+                    if stream is not None and hasattr(stream, "is_dip_confirmed"):
+                        try:
+                            ec_confirmed = stream.is_dip_confirmed(
+                                mint, float(pos.entry_price_sol),
+                                -self.config.vshape_early_crash_pct,
+                                window_sec=5.0, min_confirmations=3)
+                        except Exception:
+                            ec_confirmed = True
+                # else: pnl_pct <= -50% → emergency, skip confirmation (ec_confirmed stays True)
+                if not ec_confirmed:
+                    logger.info(
+                        f"M4: {pos.token.symbol} — EC pnl={pnl_pct:+.2%} "
+                        f"DIP_NOT_CONFIRMED (require ≥3 swaps below "
+                        f"-{self.config.vshape_early_crash_pct:.0%} in 5s) — defer")
+                    continue
+                if pnl_pct <= -EMERGENCY_BYPASS_PNL:
+                    logger.warning(
+                        f"M4: {pos.token.symbol} — EC EMERGENCY pnl={pnl_pct:+.2%} "
+                        f"<= -{EMERGENCY_BYPASS_PNL:.0%} — bypassing dip_confirmed")
                 if self._defer_exit_for_retry(pos, "early_crash"):
                     continue
                 self._record_sell_trigger_once(
@@ -6917,13 +7390,78 @@ class MemeSniper(ControllerBase):
                 logger.info(f"M4: {pos.token.symbol} — early crash triggered "
                             f"(pnl={pnl_pct:+.2%} <= -{self.config.vshape_early_crash_pct:.0%} "
                             f"within {hold_sec:.0f}s < {self.config.vshape_early_crash_window_sec}s, "
-                            f"src={price_source})")
+                            f"src={price_source}, dip_confirmed=true)")
                 exits_to_process.append(
                     (pos, "early_crash", pnl_pct, current_price, current_price, price_source))
                 continue
 
             # Stop loss (hard floor)
+            # B6 fix (2026-05-09): require dip confirmation. Audit showed
+            # 87% of SL trades recovered >30% within 10min after exit —
+            # SL was firing on transient single-tick dips. Require ≥3 swaps
+            # within last 5s confirming pnl <= -SL_pct before firing.
+            # B6.1 fix (2026-05-12): bypass dip_confirmed when token is
+            # clearly dead (pnl <= -50%). Dead pools have no swap stream →
+            # no confirmations → SL silently deferred. Audit found 8,194
+            # DIP_NOT_CONFIRMED entries blocking SL on -90% tokens.
+            # B6.2 fix (2026-05-14): 7d audit found SL still fires 16pp late
+            # on average (actual -45.8% vs spec -30%) because dead pools take
+            # too long to hit the -50% emergency floor. Two changes:
+            #   (a) lower emergency bypass -50% → -40% (still avoids the
+            #       sandwich-tick over-fire that motivated B6)
+            #   (b) time-escape: once pnl crosses -SL_pct, if dip_confirmed
+            #       remains False for ≥SL_TIME_ESCAPE_SEC (10s) → fire anyway
+            EMERGENCY_BYPASS_PNL = 0.40  # -40%: lowered from 0.50 per B6.2
+            SL_TIME_ESCAPE_SEC = 10.0    # dead-pool fallback escape interval
+            # Reset breach timer if pnl recovered above SL threshold — only
+            # the most recent uninterrupted breach should count toward escape.
+            if pnl_pct > -self.config.stop_loss_pct and pos.sl_first_breach_ts is not None:
+                pos.sl_first_breach_ts = None
+                _pos_dirty = True
             if pnl_pct <= -self.config.stop_loss_pct:
+                # Record first breach timestamp for time-escape (B6.2)
+                if pos.sl_first_breach_ts is None:
+                    pos.sl_first_breach_ts = time.time()
+                    _pos_dirty = True
+                # Check for dip confirmation via raw swap stream
+                stream = getattr(self, "_grpc_stream", None)
+                dip_confirmed = True  # default fire (preserve old behavior on stream miss)
+                time_escape_fired = False
+                if pnl_pct > -EMERGENCY_BYPASS_PNL:
+                    # Normal flow: require dip confirmation
+                    if stream is not None and hasattr(stream, "is_dip_confirmed"):
+                        try:
+                            dip_confirmed = stream.is_dip_confirmed(
+                                mint, float(pos.entry_price_sol),
+                                -self.config.stop_loss_pct,
+                                window_sec=5.0, min_confirmations=3)
+                        except Exception as _e:
+                            dip_confirmed = True  # safety: any error → preserve old fire
+                    # B6.2: time-escape — if we've been below SL threshold
+                    # for ≥10s without confirmation, fire regardless (dead pool)
+                    if not dip_confirmed:
+                        elapsed_below_sl = time.time() - pos.sl_first_breach_ts
+                        if elapsed_below_sl >= SL_TIME_ESCAPE_SEC:
+                            dip_confirmed = True
+                            time_escape_fired = True
+                # else: pnl_pct <= -40% → emergency, skip confirmation (dip_confirmed stays True)
+                if not dip_confirmed:
+                    logger.info(
+                        f"M4: {pos.token.symbol} — SL pnl={pnl_pct:+.2%} "
+                        f"DIP_NOT_CONFIRMED (require ≥3 swaps below "
+                        f"-{self.config.stop_loss_pct:.0%} in 5s) — defer "
+                        f"(time_below_sl={time.time() - pos.sl_first_breach_ts:.1f}s, "
+                        f"escape in {max(0, SL_TIME_ESCAPE_SEC - (time.time() - pos.sl_first_breach_ts)):.1f}s)")
+                    continue  # don't fire SL on transient dip
+                if time_escape_fired:
+                    logger.warning(
+                        f"M4: {pos.token.symbol} — SL TIME-ESCAPE pnl={pnl_pct:+.2%} "
+                        f"after {time.time() - pos.sl_first_breach_ts:.1f}s stuck below "
+                        f"-{self.config.stop_loss_pct:.0%} (dead-pool fallback)")
+                elif pnl_pct <= -EMERGENCY_BYPASS_PNL:
+                    logger.warning(
+                        f"M4: {pos.token.symbol} — SL EMERGENCY pnl={pnl_pct:+.2%} "
+                        f"<= -{EMERGENCY_BYPASS_PNL:.0%} — bypassing dip_confirmed")
                 if self._defer_exit_for_retry(pos, "stop_loss"):
                     continue
                 self._record_sell_trigger_once(
@@ -6932,7 +7470,7 @@ class MemeSniper(ControllerBase):
                     trigger_mid_source=price_source, peak_pnl_pct=pos.peak_pnl_pct)
                 logger.info(f"M4: {pos.token.symbol} — stop loss triggered "
                             f"(pnl={pnl_pct:+.2%} <= -{self.config.stop_loss_pct:.0%}, "
-                            f"src={price_source})")
+                            f"src={price_source}, dip_confirmed=true)")
                 exits_to_process.append(
                     (pos, "stop_loss", pnl_pct, current_price, current_price, price_source))
                 continue
@@ -6941,9 +7479,23 @@ class MemeSniper(ControllerBase):
             # immediately. This fires BEFORE trail/grace logic because a
             # parabolic pump that retraces 10% could still lose 100%+ in
             # meme-coin liquidity. take_profit_pct=0 disables this gate.
+            # TP gate fix 2026-05-14: require executable peak ≥ TP × 0.5
+            # before firing. 7d audit (n=16) found TP fires at avg +193%
+            # with poll-peak only +1.3% — pure Jupiter Price API spikes
+            # the bot can never actually execute against. Without this gate
+            # every TP fire is gas-only loss. With it, only real pumps fire.
+            TP_REAL_PEAK_RATIO = 0.5
             if (self.config.take_profit_pct > 0
                     and pnl_pct >= self.config.take_profit_pct
                     and price_source == "grpc_pool"):
+                tp_min_real_peak = self.config.take_profit_pct * TP_REAL_PEAK_RATIO
+                if pos.peak_pnl_pct_poll < tp_min_real_peak:
+                    logger.info(
+                        f"M4: {pos.token.symbol} — TP candidate REJECTED "
+                        f"(pnl={pnl_pct:+.2%} >= {self.config.take_profit_pct:+.0%} "
+                        f"but poll_peak={pos.peak_pnl_pct_poll:+.2%} < "
+                        f"{tp_min_real_peak:+.0%} — likely API spike, not real)")
+                    continue
                 if self._defer_exit_for_retry(pos, "take_profit"):
                     continue
                 self._record_sell_trigger_once(
@@ -6952,7 +7504,7 @@ class MemeSniper(ControllerBase):
                     trigger_mid_source=price_source, peak_pnl_pct=pos.peak_pnl_pct)
                 logger.info(f"M4: {pos.token.symbol} — TAKE PROFIT triggered "
                             f"(pnl={pnl_pct:+.2%} >= {self.config.take_profit_pct:+.0%}, "
-                            f"src={price_source})")
+                            f"poll_peak={pos.peak_pnl_pct_poll:+.2%}, src={price_source})")
                 exits_to_process.append(
                     (pos, "take_profit", pnl_pct, current_price, current_price, price_source))
                 continue
@@ -7050,6 +7602,56 @@ class MemeSniper(ControllerBase):
                              current_price, price_source))
                         continue
 
+            # ── v5.5.1 Chainstack-native profit-protect soft-exit (Phase 15g, 2026-05-11) ──
+            # Mirrors v5.3 fire pattern. Path C 12-feature model. Bug-fix
+            # retrain (BUG-1/2/3 corrected). Phase 3 audit 27/28 PASS.
+            # Fire requires BOTH gates: raw_cur_pnl ≥ profit_gate (default 5%)
+            # AND p_dd_v5_5 ≥ cutoff (default 0.60, prod 0.75 conservative).
+            #
+            # When `v5_5_exit_enabled=True` and `v5_5_exit_shadow_only=False`,
+            # v5.5 fires real exits. v5.3 fire block above runs first; if v5.3
+            # fired, the `continue` skips this. So v5.3 always wins ties when
+            # both enabled (intentional for cutover transition).
+            if (self.config.v5_5_exit_enabled
+                    and not self.config.v5_5_exit_shadow_only
+                    and hold_sec >= int(self.config.v5_5_exit_grace_sec)):
+                v5_5_scores = getattr(pos, "last_v5_5_score", None)
+                v5_5_score_t = getattr(pos, "last_v5_5_score_t", 0.0)
+                v5_5_age = now - float(v5_5_score_t) if v5_5_score_t else float("inf")
+                if v5_5_scores and v5_5_age <= float(self.config.v5_5_exit_score_max_age_sec):
+                    p_v5_5 = v5_5_scores.get("p_dd_v5_5")
+                    raw_pnl_v5_5 = v5_5_scores.get("raw_cur_pnl")
+                    # Peak guard (default 1.0 = disabled; v5.5 model already
+                    # has ps_peak_pnl_so_far as feature).
+                    peak_skip_v55 = float(getattr(
+                        self.config, "v5_5_exit_peak_skip_threshold", 1.0) or 1.0)
+                    peak_now = float(getattr(pos, "peak_pnl_pct", 0.0) or 0.0)
+                    profit_gate_v55 = float(self.config.v5_5_exit_profit_gate)
+                    cutoff_v55 = float(self.config.v5_5_exit_cutoff)
+                    if (p_v5_5 is not None
+                            and raw_pnl_v5_5 is not None
+                            and float(raw_pnl_v5_5) >= profit_gate_v55
+                            and float(p_v5_5) >= cutoff_v55
+                            and peak_now < peak_skip_v55):
+                        if self._defer_exit_for_retry(pos, "v5_5_softexit"):
+                            continue
+                        self._record_sell_trigger_once(
+                            pos, "v5_5_softexit", pnl_pct=pnl_pct, trigger_pnl_pct=pnl_pct,
+                            trigger_price_sol=current_price,
+                            trigger_mid_price_sol=current_price,
+                            trigger_mid_source=price_source,
+                            peak_pnl_pct=pos.peak_pnl_pct)
+                        logger.info(
+                            f"M4: {pos.token.symbol} — V5.5 PROFIT-PROTECT EXIT "
+                            f"(p_dd_v5_5={float(p_v5_5):.3f}>={cutoff_v55:.2f}, "
+                            f"raw_cur_pnl={float(raw_pnl_v5_5):+.2%}>={profit_gate_v55:.0%}, "
+                            f"pnl={pnl_pct:+.2%}, peak={pos.peak_pnl_pct:+.2%}, "
+                            f"hold={hold_sec:.0f}s, age={v5_5_age:.0f}s)")
+                        exits_to_process.append(
+                            (pos, "v5_5_softexit", pnl_pct, current_price,
+                             current_price, price_source))
+                        continue
+
             # ── v4.1 profit-protect soft-exit (Phase 15d, 2026-04-27 mode) ──
             # OLD MODE (rug-confirmation): fired whenever v4_score >= 0.65,
             #   typically at pnl ≈ -25% (= SL territory). Made things worse
@@ -7115,16 +7717,76 @@ class MemeSniper(ControllerBase):
             # Phase 16.3 Step 3 audit fix — coalesce peak + trailing-activated
             # updates into ONE save_position call. Previously two separate
             # writes could partially persist on crash.
+            #
+            # B5 fix (2026-05-09): peak update from current `pnl_pct` (15s
+            # median-of-7 in get_swap_prices_batch) misses intra-tick spikes —
+            # 5s pumps complete between polls and are diluted by median.
+            # v2 sim audit showed live trail rate 4% vs sim 81% on same panel.
+            # Use sandwich-filtered max from gRPC swap record buffer instead.
             _pos_dirty = False
-            if pnl_pct > pos.peak_pnl_pct and price_source == "grpc_pool":
+            current_poll_peak_updated = False
+            # B5 fix 2026-05-14: maintain TWO peaks:
+            #   peak_pnl_pct       — observed peak (poll OR stream sandwich-max)
+            #                        used only for trailing ACTIVATION
+            #   peak_pnl_pct_poll  — executable peak (poll-observed only)
+            #                        used for trailing drop calculation
+            # Prior version overwrote peak_pnl_pct with stream sandwich-max,
+            # which captures spikes the bot's price-poll never saw. Trail then
+            # fired drop_from_peak against a price the bot couldn't execute
+            # against — live audit (7d, n=56 trailing) showed avg 32pp late.
+            if price_source == "grpc_pool" and pnl_pct > pos.peak_pnl_pct:
                 pos.peak_pnl_pct = pnl_pct
                 _pos_dirty = True
-
-            if not pos.trailing_activated and pnl_pct >= self.config.trailing_activation_pct:
-                pos.trailing_activated = True
+                current_poll_peak_updated = True
+            if price_source == "grpc_pool" and pnl_pct > pos.peak_pnl_pct_poll:
+                pos.peak_pnl_pct_poll = pnl_pct
                 _pos_dirty = True
-                logger.info(f"M4: {pos.token.symbol} — TRAILING STOP ACTIVATED "
-                            f"(pnl={pnl_pct:+.2%} >= {self.config.trailing_activation_pct:+.0%})")
+
+            # Sandwich-filtered max from raw swap stream feeds peak_pnl_pct
+            # ONLY — used to activate trailing earlier on spikes the bot's
+            # price feed missed. It does NOT feed peak_pnl_pct_poll, so drop
+            # calculations stay anchored to executable poll-observed peaks.
+            try:
+                stream = getattr(self, "_grpc_stream", None)
+                if stream is not None and hasattr(stream, "get_peak_price_since"):
+                    peak_px = stream.get_peak_price_since(
+                        mint, since_ts=pos.entry_time)
+                    if peak_px is not None and pos.entry_price_sol > 0:
+                        peak_pnl_from_stream = (peak_px - pos.entry_price_sol) / pos.entry_price_sol
+                        if peak_pnl_from_stream > pos.peak_pnl_pct:
+                            old_peak = pos.peak_pnl_pct
+                            pos.peak_pnl_pct = peak_pnl_from_stream
+                            _pos_dirty = True
+                            if not current_poll_peak_updated:
+                                logger.info(
+                                    f"M4: {pos.token.symbol} — peak raised by stream "
+                                    f"({old_peak:+.2%} → {peak_pnl_from_stream:+.2%}, "
+                                    f"current poll pnl={pnl_pct:+.2%}, "
+                                    f"poll_peak={pos.peak_pnl_pct_poll:+.2%})")
+            except Exception as _b5_e:
+                # Defensive — never let B5 fix break monitor loop
+                logger.debug(f"M4: {pos.token.symbol} B5 peak-from-stream skipped: {_b5_e}")
+
+            # Trailing activation: by EITHER current pnl OR (B5 fix) historical
+            # peak. Without the peak-based path, B5's raised peak is silently
+            # discarded for any token where current pnl is below trail_act —
+            # making the B5 fix useless for spike-then-crash patterns (the
+            # whole motivating case).
+            if not pos.trailing_activated:
+                if pnl_pct >= self.config.trailing_activation_pct:
+                    pos.trailing_activated = True
+                    _pos_dirty = True
+                    logger.info(f"M4: {pos.token.symbol} — TRAILING STOP ACTIVATED "
+                                f"(pnl={pnl_pct:+.2%} >= {self.config.trailing_activation_pct:+.0%})")
+                elif pos.peak_pnl_pct >= self.config.trailing_activation_pct:
+                    # B5 follow-up: peak crossed threshold (from stream), but
+                    # current pnl is below. Activate trail so subsequent drop
+                    # can trigger sell.
+                    pos.trailing_activated = True
+                    _pos_dirty = True
+                    logger.info(f"M4: {pos.token.symbol} — TRAILING STOP ACTIVATED via peak "
+                                f"(peak={pos.peak_pnl_pct:+.2%} >= {self.config.trailing_activation_pct:+.0%}, "
+                                f"current pnl={pnl_pct:+.2%})")
             if _pos_dirty and not getattr(pos, "_removed", False):
                 # BUG 3 FIX (2026-04-30): skip save if position was already
                 # marked removed by _execute_sell (or _recover_phantom_sell).
@@ -7132,7 +7794,11 @@ class MemeSniper(ControllerBase):
                 self.db.save_position(pos)
 
             if pos.trailing_activated:
-                drop_from_peak = pos.peak_pnl_pct - pnl_pct
+                # B5 fix 2026-05-14: drop measured against EXECUTABLE peak
+                # (poll-observed), not stream sandwich-max. Live audit found
+                # using stream peak made trail fire 32pp late on average
+                # because the bot couldn't have sold at the stream spike.
+                drop_from_peak = pos.peak_pnl_pct_poll - pnl_pct
                 if drop_from_peak >= self.config.trailing_drop_pct:
                     if self._defer_exit_for_retry(pos, "trailing_stop"):
                         continue
@@ -7141,7 +7807,8 @@ class MemeSniper(ControllerBase):
                         trigger_price_sol=current_price, trigger_mid_price_sol=current_price,
                         trigger_mid_source=price_source, peak_pnl_pct=pos.peak_pnl_pct)
                     logger.info(f"M4: {pos.token.symbol} — trailing stop triggered "
-                                f"(peak={pos.peak_pnl_pct:+.2%}, now={pnl_pct:+.2%}, "
+                                f"(poll_peak={pos.peak_pnl_pct_poll:+.2%} "
+                                f"(stream_peak={pos.peak_pnl_pct:+.2%}), now={pnl_pct:+.2%}, "
                                 f"drop={drop_from_peak:.2%} >= {self.config.trailing_drop_pct:.0%}, "
                                 f"src={price_source})")
                     exits_to_process.append(
