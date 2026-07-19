@@ -42,6 +42,10 @@ ACCOUNT_IDX_QUOTE_MINT = 4
 # Max entries in slot→block_time cache (~500 slots = ~3-4 min at 400ms/slot)
 SLOT_CACHE_MAX = 500
 
+# Solana validator slot time (avg ~0.4s, with rare skipped slots).
+# Used by _get_block_time for cache-miss estimation (Phase 26.X 2026-05-11).
+SLOT_TIME_SEC = 0.4
+
 # Dust threshold for swap volume (SOL)
 DUST_THRESHOLD_SOL = 0.01
 
@@ -580,8 +584,32 @@ class GeyserPumpSwapStream:
                 del self._slot_time_cache[s]
 
     def _get_block_time(self, slot: int) -> int:
-        """Get block_time for a slot, falling back to current time."""
-        return self._slot_time_cache.get(slot, int(time.time()))
+        """Get block_time for a slot.
+
+        Phase 26.X (2026-05-11): cache miss no longer falls back to wall
+        clock (which caused +1-3s systematic bias on stored swaps.timestamp;
+        empirical: 71/100 production rows off by exactly +1s, mean +3.47s
+        vs RPC blockTime ground truth). Estimate from nearest cached
+        (slot, time) anchor via Solana ~0.4s slot time. Wall-clock
+        fallback retained ONLY for cold-start (cache empty) case.
+        """
+        cached = self._slot_time_cache.get(slot)
+        if cached is not None:
+            return cached
+
+        if not self._slot_time_cache:
+            # Cold start: no anchor — fall back to wall clock with warning.
+            logger.warning(
+                f"_get_block_time: cache empty, slot={slot} → wall clock fallback"
+            )
+            return int(time.time())
+
+        # Find nearest cached (slot, time) anchor; estimate via slot delta.
+        nearest_slot = min(
+            self._slot_time_cache.keys(), key=lambda s: abs(s - slot)
+        )
+        nearest_time = self._slot_time_cache[nearest_slot]
+        return nearest_time + int(round((slot - nearest_slot) * SLOT_TIME_SEC))
 
     # ────────────────────────────────────────────────────────────────────
     # Transaction routing
@@ -782,6 +810,93 @@ class GeyserPumpSwapStream:
         cutoff = time.time() - max_age_sec
         # SwapRecord.timestamp is block_time (seconds). Filter and return.
         return [r for r in dq if r.timestamp >= cutoff]
+
+    def is_dip_confirmed(self, mint: str, entry_price: float,
+                          threshold_pnl_pct: float,
+                          window_sec: float = 5.0,
+                          min_confirmations: int = 3):
+        """B6 fix (2026-05-09): require N confirming swaps below threshold
+        before firing SL/EC. Mirror image of get_peak_price_since.
+
+        Returns True if there are ≥ min_confirmations swaps in the last
+        window_sec where pnl <= threshold_pnl_pct AND price within
+        sandwich gate (≤ 120% of candidate price). This filters out single
+        transient dip ticks that bounce back within 5s — 87% of SL trades
+        in audit recovered > 30% within 10min after exit, indicating SL
+        triggered on momentary dips.
+
+        Args:
+            mint: token mint
+            entry_price: position entry price (for pnl calc)
+            threshold_pnl_pct: SL/EC threshold (negative, e.g. -0.30)
+            window_sec: window to look for confirming swaps
+            min_confirmations: number of swaps required at or below threshold
+
+        Returns:
+            True if dip is confirmed (real price drop), False if transient
+        """
+        if entry_price <= 0:
+            return True  # safety: can't validate, allow exit
+        dq = self._recent_swap_records.get(mint)
+        if not dq:
+            return False  # no data → don't fire SL on stale state
+        cutoff_ts = time.time() - window_sec
+        recent = [r for r in dq if r.timestamp >= cutoff_ts and r.price_sol > 0]
+        if len(recent) < min_confirmations:
+            # Not enough recent ticks at all → don't fire on partial data
+            return False
+        below_threshold = 0
+        for r in recent:
+            pnl = (r.price_sol - entry_price) / entry_price
+            if pnl <= threshold_pnl_pct:
+                below_threshold += 1
+        return below_threshold >= min_confirmations
+
+    def get_peak_price_since(self, mint: str, since_ts: float,
+                              sandwich_window_sec: float = 5.0,
+                              min_confirmations: int = 2):
+        # Returns Optional[float] — sandwich-filtered max price since since_ts.
+        """Sandwich-filtered max price since `since_ts` (B5 fix 2026-05-09).
+
+        Median-based `get_swap_prices_batch` (15s + median-of-7) misses
+        intra-tick spikes (5s pumps that complete between polls), causing
+        peak/trail logic to miss legitimate +20% peaks. v2 sim audit showed
+        this caused 20× divergence in trailing exit rate (sim 81% / live 4%).
+
+        This method returns max price WITH sandwich protection: a price tick
+        only counts if there are ≥ `min_confirmations` other swaps within
+        `sandwich_window_sec` at >= 80% of that tick's price. Single-tick
+        Jupiter sandwich spikes (BK postmortem) are rejected by this gate.
+
+        Args:
+            mint: token mint
+            since_ts: only consider swaps with block_time >= since_ts (e.g.
+                position entry timestamp)
+            sandwich_window_sec: window around each candidate tick to look
+                for confirmation swaps
+            min_confirmations: number of other swaps within window required
+                at >= 80% of candidate price (default 2 → at least 3 swaps
+                within 5s confirming the high)
+
+        Returns:
+            float (max confirmed price) or None if no confirmed peak found
+        """
+        dq = self._recent_swap_records.get(mint)
+        if not dq:
+            return None
+        valid = [r for r in dq if r.timestamp >= since_ts and r.price_sol > 0]
+        if len(valid) < min_confirmations + 1:
+            return None
+        confirmed_max = None
+        for r in valid:
+            nearby = [v for v in valid
+                      if abs(v.timestamp - r.timestamp) <= sandwich_window_sec
+                      and v.price_sol >= 0.80 * r.price_sol]
+            # nearby includes r itself; need >= min_confirmations + 1 total
+            if len(nearby) >= min_confirmations + 1:
+                if confirmed_max is None or r.price_sol > confirmed_max:
+                    confirmed_max = r.price_sol
+        return float(confirmed_max) if confirmed_max is not None else None
 
     # ─── Rug event watched-pool management ──────────────────────────────
     def watch_pool(self, pool_address: str, mint_address: str) -> None:
@@ -1010,11 +1125,59 @@ class GeyserPumpSwapStream:
 
         price_sol = sol_amount / base_amount
 
+        # Phase 22.E Route Y (2026-05-07): in-line outlier guard.
+        # If recent prices exist for this mint and new price is >100x or
+        # <0.01x median, drop the swap. Prevents downstream poisoning of
+        # OHLCV bars + V5.x feature panels. Bootstrap-safe: skip when <5
+        # recent prices.
+        recent_dq = self._recent_swap_prices.get(base_mint)
+        if recent_dq and len(recent_dq) >= 5:
+            recent_prices = sorted(p for p, _ in recent_dq if p > 0)
+            if recent_prices:
+                median_p = recent_prices[len(recent_prices) // 2]
+                if median_p > 0:
+                    ratio = price_sol / median_p
+                    if ratio > 100.0 or ratio < 0.01:
+                        self._stats["parse_price_outlier"] = (
+                            self._stats.get("parse_price_outlier", 0) + 1
+                        )
+                        # Sample warning for first 20 rejections
+                        if self._stats["parse_price_outlier"] <= 20:
+                            logger.warning(
+                                f"[parse_outlier] reject mint={base_mint[:12]} "
+                                f"price={price_sol:.4e} median={median_p:.4e} "
+                                f"ratio={ratio:.2e}"
+                            )
+                        return None
+
+        # Phase 22.E (2026-05-08 v2): align trader_address with training pipeline.
+        # Training (09d_normalize_backfill_swaps.py:312) extracts Birdeye `owner`
+        # field — the wallet whose post-token-balance changed (= actual user).
+        # Live previously used account_keys[0] (signer/fee payer) which differs
+        # from owner in JITO bundles, MEV sandwiches, and aggregator routes.
+        # Caused 2-3.6× drift on v5.3 hc_n_net_long_t / hc_top3 / hc_hhi.
+        #
+        # v2 fix: prefer signer when signer is also in base_deltas (= direct
+        # trade where signer owns the user's token account, common case ≈80%).
+        # Only fall back to max-abs-delta when signer isn't in base_deltas
+        # (bundled tx / aggregator routing where bundler signs for user).
+        # Avoids accidentally picking pool authority (same |delta| as user)
+        # in the common case.
+        if signer and signer in base_deltas:
+            trader = signer
+        elif base_deltas:
+            # Bundled / aggregated: signer didn't move tokens. Pick the
+            # owner whose token delta is largest in absolute value as
+            # best-effort approximation of the user.
+            trader = max(base_deltas.items(), key=lambda x: abs(x[1]))[0]
+        else:
+            trader = signer or ""
+
         return SwapRecord(
             timestamp=block_time,
             price_sol=price_sol,
             volume_sol=sol_amount,
             is_buy=is_buy,
             base_amount=base_amount,
-            trader_address=signer or "",
+            trader_address=trader or "",
         )

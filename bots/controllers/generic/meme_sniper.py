@@ -91,11 +91,29 @@ except Exception:  # pragma: no cover
     RugFilterV4_2 = None  # type: ignore
     HAS_RUG_FILTER_V4_2 = False
 
+# v4.3 — cross-source-aligned retrain on Chainstack data (22 features after G_micro).
+# Spec: model_specs/2026-05-13_rug_filter_v4_3_SPEC.md §14
+try:
+    from controllers.generic.rug_filter_v4_3 import RugFilterV4_3
+    HAS_RUG_FILTER_V4_3 = True
+except Exception:  # pragma: no cover
+    RugFilterV4_3 = None  # type: ignore
+    HAS_RUG_FILTER_V4_3 = False
+
 try:
     from controllers.generic.geyser_stream import GeyserPumpSwapStream
     HAS_GEYSER = True
 except ImportError:
     HAS_GEYSER = False
+
+# VWMP — Volume-Weighted Median Price for phantom-resistant current_price.
+# Spec: research_notebooks/meme_sniper/vwmp_price_defense/2026-05-15_vwmp_price_source_SPEC.md
+try:
+    from controllers.generic.vwmp import compute_vwmp_with_diagnostics
+    HAS_VWMP = True
+except Exception:  # pragma: no cover
+    compute_vwmp_with_diagnostics = None  # type: ignore
+    HAS_VWMP = False
 
 logger = logging.getLogger(__name__)
 
@@ -202,6 +220,41 @@ class MemeSniperConfig(ControllerConfigBase):
     # yml to keep yml-fail fallback safe.
     trailing_drop_pct: float = Field(default=0.07,
                                      json_schema_extra={"is_updatable": True})
+
+    # Phantom guard 2026-05-15: gate poll-peak updates against stream confirmation.
+    # Pool snapshot can briefly show prices that didn't trade (MEV/partial-fill/
+    # sandwich 1-block reserve imbalances). These poison peak_pnl_pct_poll and
+    # cascade into phantom TP fires (May 13 audit: 4/5 TPs fired on phantom states,
+    # avg gap trig→market = 124pp).
+    # Logic: only update peak_pnl_pct_poll if sandwich-filtered stream peak is at
+    # least `ratio × new_poll_pnl`. Ratio 0.5 = require stream to confirm at least
+    # half the level. Lower ratio = more permissive (allows poll-stream divergence).
+    # Higher ratio = stricter. Set to 0.0 to disable guard entirely (revert behavior).
+    poll_peak_stream_confirm_ratio: float = Field(default=0.5,
+                                                   json_schema_extra={"is_updatable": True})
+
+    # VWMP — Volume-Weighted Median Price for exit decisions (2026-05-15)
+    # Replaces raw gRPC pool snapshot as authoritative current_price source.
+    # Phantom-resistant: median + volume weighting filters MEV/sandwich
+    # 1-block reserve imbalances (empirical: phantom vol = 0.00-0.03% of
+    # total pool volume, well below 50% cumulative-median position).
+    # Spec: research_notebooks/meme_sniper/vwmp_price_defense/
+    #       2026-05-15_vwmp_price_source_SPEC.md
+    # Direct-to-live deployment per §10 Q4; yml flag rollback always available.
+    vwmp_enabled: bool = Field(default=True,
+                                json_schema_extra={"is_updatable": True})
+    vwmp_window_s: float = Field(default=5.0,
+                                  json_schema_extra={"is_updatable": True})
+    vwmp_vol_gate_sol: float = Field(default=0.01,
+                                      json_schema_extra={"is_updatable": True})
+    vwmp_min_swaps: int = Field(default=3,
+                                 json_schema_extra={"is_updatable": True})
+    vwmp_fallback_grace_s: float = Field(default=30.0,
+                                          json_schema_extra={"is_updatable": True})
+    vwmp_fallback_alert_count: int = Field(default=30,
+                                            json_schema_extra={"is_updatable": True})
+    vwmp_shadow_log_enabled: bool = Field(default=True,
+                                            json_schema_extra={"is_updatable": True})
 
     # Risk management
     max_positions: int = Field(default=5, json_schema_extra={"is_updatable": True})
@@ -593,6 +646,25 @@ class MemeSniperConfig(ControllerConfigBase):
     shadow_rug_v4_2_window_sec: int = Field(default=300,
                                               json_schema_extra={"is_updatable": True})
     shadow_rug_v4_2_min_swaps: int = Field(default=10,
+                                             json_schema_extra={"is_updatable": True})
+
+    # Rug filter v4.3 — cross-source-aligned retrain on Chainstack data
+    # 22 features (G_micro audit dropped kyle_lambda + roll_spread)
+    # Holdout AUC 0.667, prod top20% cutoff (0.40) blocks ~20% with 26% big_loss recall
+    # Spec: model_specs/2026-05-13_rug_filter_v4_3_SPEC.md §14
+    # SHADOW ONLY initially (first 7 days).
+    shadow_rug_v4_3_enabled: bool = Field(default=True,
+                                            json_schema_extra={"is_updatable": True})
+    shadow_rug_v4_3_shadow_only: bool = Field(default=True,
+                                                json_schema_extra={"is_updatable": True})
+    shadow_rug_v4_3_model_path: str = Field(
+        default="/home/hummingbot/models/rug_v4_3_winner.pkl",
+        json_schema_extra={"is_updatable": True})
+    shadow_rug_v4_3_cutoff: float = Field(default=0.40,
+                                            json_schema_extra={"is_updatable": True})
+    shadow_rug_v4_3_window_sec: int = Field(default=300,
+                                              json_schema_extra={"is_updatable": True})
+    shadow_rug_v4_3_min_swaps: int = Field(default=10,
                                              json_schema_extra={"is_updatable": True})
 
     # Phase B shadow: event-triggered entry scanner (research artifact).
@@ -1051,6 +1123,34 @@ class MemeSniper(ControllerBase):
                 logger.warning(
                     f"RugFilterV4_2 path not found: {config.shadow_rug_v4_2_model_path} "
                     "— v4.2 shadow scorer disabled"
+                )
+
+        # Rug filter v4.3 — cross-source-aligned (22 features after G_micro)
+        # Spec: model_specs/2026-05-13_rug_filter_v4_3_SPEC.md §14
+        self.rug_filter_v4_3_model = None
+        if config.shadow_rug_v4_3_enabled and HAS_RUG_FILTER_V4_3:
+            if config.shadow_rug_v4_3_model_path and os.path.exists(config.shadow_rug_v4_3_model_path):
+                try:
+                    self.rug_filter_v4_3_model = RugFilterV4_3(
+                        model_path=config.shadow_rug_v4_3_model_path,
+                        cutoff=config.shadow_rug_v4_3_cutoff,
+                        window_s=config.shadow_rug_v4_3_window_sec,
+                        min_swaps=config.shadow_rug_v4_3_min_swaps,
+                    )
+                    logger.info(
+                        f"RugFilterV4_3 loaded (depth4_balanced, 22 features): "
+                        f"cutoff={config.shadow_rug_v4_3_cutoff:.4f} "
+                        f"window={config.shadow_rug_v4_3_window_sec}s "
+                        f"min_swaps={config.shadow_rug_v4_3_min_swaps} "
+                        f"shadow_only={config.shadow_rug_v4_3_shadow_only}"
+                    )
+                except Exception as e:
+                    logger.error(f"RugFilterV4_3 load failed: {e}")
+                    self.rug_filter_v4_3_model = None
+            else:
+                logger.warning(
+                    f"RugFilterV4_3 path not found: {config.shadow_rug_v4_3_model_path} "
+                    "— v4.3 shadow scorer disabled"
                 )
 
         # Phase B event-triggered scanner (shadow only)
@@ -1756,6 +1856,107 @@ class MemeSniper(ControllerBase):
                         f"simple_t5m_slope_{reason}_{slope_pct*100:+.0f}pct")
                     continue
 
+                # ── RugFilter v4.3 hard-gate (2026-05-14) ──
+                # Wired only when shadow_rug_v4_3_shadow_only=false. When
+                # active, query the latest eval written by the T+305s heartbeat
+                # in `_run_shadow_rug_filter_v4_3`. If no eval yet (SIMPLE-T5M
+                # fires at age 300-304s before heartbeat catches up — observed
+                # in 100% of post-deploy gate firings), score ON-DEMAND so the
+                # gate is never silently bypassed.
+                v4_3_gate_active = (
+                    getattr(self.config, "shadow_rug_v4_3_enabled", False)
+                    and not getattr(self.config, "shadow_rug_v4_3_shadow_only", True)
+                    and self.rug_filter_v4_3_model is not None
+                )
+                v4_3_decision: Optional[str] = None
+                v4_3_score_s: str = "NaN"
+                v4_3_cutoff_s: str = "?"
+                if v4_3_gate_active:
+                    try:
+                        eval_row = self.db.get_latest_shadow_rug_v4_3_eval(
+                            token.mint_address)
+                    except Exception as _e_v43:
+                        logger.debug(
+                            f"SIMPLE-T5M: {token.symbol} v4.3 DB lookup failed: "
+                            f"{_e_v43}")
+                        eval_row = None
+
+                    if eval_row:
+                        v4_3_decision = eval_row["decision"]
+                        if eval_row.get("score") is not None:
+                            v4_3_score_s = f"{eval_row['score']:.3f}"
+                        v4_3_cutoff_s = f"{eval_row['cutoff']:.3f}"
+                    else:
+                        # ── On-demand fallback: score synchronously now ──
+                        # Mirrors `_run_shadow_rug_filter_v4_3` body but skips
+                        # the "if elapsed < window_s+5" gate (we already know
+                        # age >= 300s, close enough). Writes to DB so the
+                        # heartbeat won't re-score and offline analysis sees
+                        # the same row regardless of which path triggered.
+                        try:
+                            db_path = self.db.db_path if hasattr(self.db, "db_path") else None
+                            if db_path:
+                                try:
+                                    self._flush_swaps_to_db(
+                                        token.mint_address, unregister=False)
+                                except Exception as _flush_err:
+                                    logger.debug(
+                                        f"SIMPLE-T5M: {token.symbol} v4.3 pre-score "
+                                        f"flush failed: {_flush_err}")
+                                result = self.rug_filter_v4_3_model.score_from_sqlite(
+                                    db_path=db_path,
+                                    mint_address=token.mint_address,
+                                    graduation_time=token.graduation_time,
+                                )
+                                window_s = int(self.config.shadow_rug_v4_3_window_sec)
+                                elapsed = age
+                                self.db.record_shadow_rug_v4_3_eval(
+                                    mint_address=token.mint_address,
+                                    symbol=token.symbol,
+                                    graduation_time=token.graduation_time,
+                                    scored_at_delay_s=elapsed,
+                                    window_s=window_s,
+                                    n_swaps=result.n_swaps,
+                                    score=(None if result.score != result.score
+                                           else result.score),
+                                    cutoff=self.rug_filter_v4_3_model.cutoff,
+                                    decision=result.decision,
+                                    reason=result.reason,
+                                    features=result.features or None,
+                                    model_version=self.rug_filter_v4_3_model.VERSION,
+                                )
+                                v4_3_decision = result.decision
+                                if result.score == result.score:
+                                    v4_3_score_s = f"{result.score:.3f}"
+                                v4_3_cutoff_s = f"{self.rug_filter_v4_3_model.cutoff:.3f}"
+                                # Mark scored on observation pool to prevent
+                                # heartbeat re-scoring later in this hold cycle.
+                                obs = self._observation_pool.get(token.mint_address)
+                                if obs is not None:
+                                    obs._rug_v4_3_scored = True
+                                logger.info(
+                                    f"RUG-V4_3-ONDEMAND: {token.symbol} "
+                                    f"score={v4_3_score_s} cutoff={v4_3_cutoff_s} "
+                                    f"n_swaps={result.n_swaps} "
+                                    f"decision={result.decision}"
+                                )
+                        except Exception as _e_score:
+                            logger.warning(
+                                f"SIMPLE-T5M: {token.symbol} v4.3 on-demand "
+                                f"scoring failed: {_e_score} — allow")
+                            v4_3_decision = None  # safe degrade → allow
+
+                    if v4_3_decision == "REJECT":
+                        logger.info(
+                            f"SIMPLE-T5M: {token.symbol} REJECT — "
+                            f"rug_v4.3 score={v4_3_score_s} >= "
+                            f"cutoff={v4_3_cutoff_s}"
+                        )
+                        self._add_to_observation_pool(
+                            token, 0.0, False,
+                            f"simple_t5m_v4_3_reject_{v4_3_score_s}")
+                        continue
+
                 # PASS — enqueue
                 from controllers.generic.meme_sniper_utils import TradeCandidate
                 candidate = TradeCandidate(
@@ -1772,9 +1973,19 @@ class MemeSniper(ControllerBase):
                     position_size_usd=float(
                         self.config.simple_t5m_position_size_usd),
                 )
+                # v4.3 tag distinguishes 3 states for offline analysis:
+                #   "v4.3 PASS"     — scored, below cutoff
+                #   "v4.3 SKIPPED"  — scoring failed or insufficient data
+                #   ""              — gate inactive (shadow_only)
+                if not v4_3_gate_active:
+                    v4_3_tag = ""
+                elif v4_3_decision == "PASS":
+                    v4_3_tag = f" v4.3 PASS ({v4_3_score_s}<{v4_3_cutoff_s})"
+                else:
+                    v4_3_tag = f" v4.3 SKIPPED ({v4_3_decision})"
                 logger.info(
                     f"SIMPLE-T5M: {token.symbol} PASS — entered at T+"
-                    f"{int(age)}s (rug_v3 PASS, M2 safety ✓)")
+                    f"{int(age)}s (M2 safety ✓{v4_3_tag})")
                 candidates.append(candidate)
                 self._candidates_seen += 1
                 self._add_to_observation_pool(
@@ -2414,6 +2625,7 @@ class MemeSniper(ControllerBase):
         await self._run_shadow_event_invariant()
         await self._run_shadow_rug_filter_v4()
         await self._run_shadow_rug_filter_v4_2()
+        await self._run_shadow_rug_filter_v4_3()
         await self._run_shadow_big_winner()
 
         # Update SOL price for USD conversion (every 60s)
@@ -2463,7 +2675,32 @@ class MemeSniper(ControllerBase):
                 self._cleanup_swap_keepalive(
                     candidate.token.mint_address, reason="buy retries exhausted")
                 continue
-            backoff = min(10 * (2 ** candidate.buy_fail_count), 120) if candidate.buy_fail_count > 0 else 0
+            # 2026-05-14: class-aware retry backoff. Original blanket
+            # `10*2^N` (20s/40s/80s/120s) wasted entry-timing alpha when the
+            # failure was a transient AMM jitter (Pump.fun bonding curve +
+            # Jupiter conservative estimator → price_impact estimate flips
+            # within 1-2 ticks even though pool state is essentially flat).
+            #   soft     = 0s (next-tick retry); covers price_impact / chase
+            #   hard     = exp backoff (upstream API down); covers snapshot /
+            #              quote_error / not_wsol — exp protects the dead API
+            #   terminal = evict immediately (pool too small, etc.)
+            fail_class = self._classify_preflight_failure(
+                candidate.buy_last_fail_reason)
+            if fail_class == "terminal" and candidate.buy_fail_count > 0:
+                bought.append(candidate)
+                logger.info(
+                    f"M3: {candidate.token.symbol} evicted — TERMINAL "
+                    f"failure (reason={candidate.buy_last_fail_reason})")
+                self._cleanup_swap_keepalive(
+                    candidate.token.mint_address,
+                    reason=f"terminal preflight fail: {candidate.buy_last_fail_reason}")
+                continue
+            if fail_class == "soft":
+                backoff = 0.0          # 1-tick retry
+            elif candidate.buy_fail_count > 0:
+                backoff = min(10.0 * (2 ** candidate.buy_fail_count), 120.0)
+            else:
+                backoff = 0.0
             if candidate.buy_last_fail_time > 0 and now - candidate.buy_last_fail_time < backoff:
                 continue
             if self.risk.can_trade(len(self._positions)):
@@ -2474,8 +2711,17 @@ class MemeSniper(ControllerBase):
                 else:
                     candidate.buy_fail_count += 1
                     candidate.buy_last_fail_time = now
-                    logger.info(f"M3: {candidate.token.symbol} buy failed (attempt "
-                                f"#{candidate.buy_fail_count}), retry in {backoff:.0f}s")
+                    # Re-classify with the *new* reason set by _execute_buy
+                    new_class = self._classify_preflight_failure(
+                        candidate.buy_last_fail_reason)
+                    next_backoff = (0.0 if new_class == "soft"
+                                    else min(10.0 * (2 ** candidate.buy_fail_count),
+                                             120.0))
+                    logger.info(
+                        f"M3: {candidate.token.symbol} buy failed (attempt "
+                        f"#{candidate.buy_fail_count}, class={new_class}, "
+                        f"reason={candidate.buy_last_fail_reason}), "
+                        f"retry in {next_backoff:.0f}s")
                     break
             elif self.risk.is_cooldown_only(len(self._positions)):
                 # Cooldown blocking — keep in queue, will retry next tick
@@ -3019,6 +3265,46 @@ class MemeSniper(ControllerBase):
             logger.debug(f"LATENCY: failed to record {event_name} for {token.symbol}: {e}")
 
     @staticmethod
+    def _classify_preflight_failure(reject_reason: str) -> str:
+        """Classify a preflight failure for retry-backoff selection.
+
+        Returns one of:
+          "soft"     — AMM/price jitter; retry immediately (next tick).
+                       Most often resolves within a single Jupiter recompute.
+          "hard"     — Upstream API down or transient network issue;
+                       exponential backoff so we don't hammer the dead service.
+          "terminal" — Pool/token property won't change; give up entirely
+                       (token evicted from queue, no further retry).
+        """
+        if not reject_reason:
+            return "hard"  # unknown → safe default
+        # Soft = recoverable on re-quote within 1-2s
+        SOFT_PREFIXES = (
+            "price_impact=",
+            "entry_chase=",
+            "price_divergence=",
+            "route_missing_biggest_pool",   # Jupiter routing varies tick-to-tick
+            "invalid_quote",                # Jupiter may return empty quote transiently
+        )
+        # Terminal = property of the token/pool, won't change
+        TERMINAL_PREFIXES = (
+            "live_liquidity=",              # pool too small, structural
+            "cum_return=",                  # already crashed
+            "cum_drawdown=",                # already crashed
+            "lookback_return=",             # last 3 bars confirmed dump
+            "rug_gate ",                    # rug filter said no
+            "missing_biggest_pool_address",
+        )
+        for prefix in SOFT_PREFIXES:
+            if reject_reason.startswith(prefix):
+                return "soft"
+        for prefix in TERMINAL_PREFIXES:
+            if reject_reason.startswith(prefix):
+                return "terminal"
+        # Default = hard (snapshot_unavailable, jupiter_quote_error, etc.)
+        return "hard"
+
+    @staticmethod
     def _safe_relative_delta(actual: Optional[float], reference: Optional[float]) -> Optional[float]:
         """Return actual/reference - 1 when both values are usable."""
         try:
@@ -3056,6 +3342,59 @@ class MemeSniper(ControllerBase):
             )
             self._sell_retry_notice_after[mint] = now + min(60.0, max(wait_sec, 5.0))
         return True
+
+    # P_RETRY A1+A2 helper (2026-05-15) — see
+    # research_notebooks/meme_sniper/latency/exit/执行延迟/06_DYING_POOL_RETRY.md
+    MAX_SELL_RETRIES = 5
+    ABANDON_COOLDOWN_SEC = 3600.0  # 1h pause after MAX retries
+
+    def _schedule_sell_retry(self, pos: Position, reason: str,
+                             context: str) -> tuple[bool, int, float]:
+        """Centralized sell-retry scheduler with A1+A2 patches (P_RETRY).
+
+        A1 (2026-05-15): time_limit + early_crash promoted to urgent backoff.
+            Previously non-urgent (30→60→120→240→300s), causing 75-100s of
+            avoidable retry latency on dying-pool exits. Now: 5→10→15→20s
+            linear, capped at 20s.
+        A2 (2026-05-15): Cap consecutive retries at MAX_SELL_RETRIES (=5).
+            Empirical: `fomo` mint 2026-04-29 retried 43 times = ~3.4 hours
+            wasted on a permanently-failing sell. After cap, log abandon
+            event + 1h cooldown + reset state.
+
+        Returns: (abandoned, fails, backoff_sec)
+            abandoned=True → caller must `return` immediately, position
+                is paused for 1h.
+            fails / backoff_sec → for logging the active attempt.
+        """
+        mint = pos.token.mint_address
+        fails = self._sell_retry_count.get(mint, 0) + 1
+
+        if fails > self.MAX_SELL_RETRIES:
+            self._sell_retry_count[mint] = 0
+            self._sell_retry_after[mint] = time.time() + self.ABANDON_COOLDOWN_SEC
+            logger.error(
+                f"M3: [SELL ABANDONED] {pos.token.symbol} reason={reason} "
+                f"after {fails - 1} consecutive fails ({context}) — pause "
+                f"{self.ABANDON_COOLDOWN_SEC:.0f}s")
+            try:
+                self._record_latency_event(
+                    pos.token, "sell_abandoned",
+                    reason=reason, attempts=fails - 1, context=context)
+                self.db.record_event(
+                    "ERROR", "sell",
+                    f"SELL ABANDONED {pos.token.symbol} after {fails - 1} fails")
+            except Exception:
+                pass
+            return (True, fails - 1, self.ABANDON_COOLDOWN_SEC)
+
+        self._sell_retry_count[mint] = fails
+        # A1: include early_crash + time_limit in urgent list
+        urgent = reason in ("stop_loss", "trailing_stop",
+                            "early_crash", "time_limit")
+        backoff = (min(5 * fails, 20) if urgent
+                   else min(30 * (2 ** (fails - 1)), 300))
+        self._sell_retry_after[mint] = time.time() + backoff
+        return (False, fails, float(backoff))
 
     async def _get_wallet_token_balance_ui(self, mint_address: str) -> Optional[float]:
         """Best-effort on-chain token balance check for stale-position cleanup."""
@@ -4724,28 +5063,79 @@ class MemeSniper(ControllerBase):
                 if not fire_reason:
                     continue
 
-                # B6 fix (2026-05-09): require dip confirmation. The single
-                # event triggering this path could be a transient sandwich
-                # tick (audit: 87% of SL exits recovered >30% within 10min).
-                # For SL/EC, require ≥3 swaps in last 5s confirming the dip.
-                # Note: this gate runs in BOTH shadow and live modes so the
-                # shadow log accurately reflects what live would do.
-                stream = getattr(self, "_grpc_stream", None)
-                if stream is not None and hasattr(stream, "is_dip_confirmed"):
-                    threshold_pct = (-self.config.stop_loss_pct
-                                      if fire_reason == "stop_loss"
-                                      else -self.config.vshape_early_crash_pct)
-                    try:
-                        if not stream.is_dip_confirmed(
+                # B6 fix (2026-05-09): require dip confirmation against single-
+                # tick sandwich spikes (87% of SL exits recovered >30% within
+                # 10min audit). For SL/EC, require ≥3 swaps in last 5s below
+                # threshold. Runs in BOTH shadow and live modes so the shadow
+                # log accurately reflects what live would do.
+                #
+                # B6.1 fix (2026-05-12): bypass dip_confirmed when token is
+                # clearly dead (pnl below emergency threshold). Dead pools have
+                # no swap stream → no confirmations possible → exits silently
+                # deferred → tokens held to 30min time_limit at ~99% loss.
+                # Thresholds: EC=-50%, SL=-40% (B6.2 lowered SL from -50%).
+                #
+                # B6.2 fix (2026-05-14): SL time-escape — fire after 10s stuck
+                # below SL threshold without confirmation (dead-pool fallback).
+                # EC has tight 120s window so no time-escape needed.
+                #
+                # PORT 2026-05-15: poll-path lines 7704+ (EC) and 7758+ (SL)
+                # already had B6.1+B6.2. Porting to gRPC fast-path here so
+                # SHADOW would_fire / live FIRE work on dead pools.
+                emergency_threshold = (
+                    0.40 if fire_reason == "stop_loss"  # SL bypass per B6.2
+                    else 0.50)                          # EC bypass per B6.1
+                SL_TIME_ESCAPE_SEC = 10.0
+                threshold_pct = (-self.config.stop_loss_pct
+                                  if fire_reason == "stop_loss"
+                                  else -self.config.vshape_early_crash_pct)
+
+                # Track SL breach for time-escape (SL only; EC has tight window)
+                if fire_reason == "stop_loss":
+                    if pos.sl_first_breach_ts is None:
+                        pos.sl_first_breach_ts = time.time()
+
+                dip_confirmed = True  # default fire (preserve old behavior on stream miss)
+                time_escape_fired = False
+                if pnl_pct > -emergency_threshold:
+                    # Normal flow: require dip confirmation
+                    stream = getattr(self, "_grpc_stream", None)
+                    if stream is not None and hasattr(stream, "is_dip_confirmed"):
+                        try:
+                            dip_confirmed = stream.is_dip_confirmed(
                                 mint, float(pos.entry_price_sol),
                                 threshold_pct,
-                                window_sec=5.0, min_confirmations=3):
-                            logger.debug(
-                                f"M4 [GRPC-{fire_reason.upper()}]: {pos.token.symbol} "
-                                f"DIP_NOT_CONFIRMED pnl={pnl_pct*100:+.1f}% — defer")
-                            continue  # transient — wait for confirmation
-                    except Exception:
-                        pass  # safety: any error → preserve old behavior
+                                window_sec=5.0, min_confirmations=3)
+                        except Exception:
+                            dip_confirmed = True  # safety
+                    # B6.2: SL time-escape — fire after 10s stuck below threshold
+                    if (not dip_confirmed
+                            and fire_reason == "stop_loss"
+                            and pos.sl_first_breach_ts is not None):
+                        elapsed = time.time() - pos.sl_first_breach_ts
+                        if elapsed >= SL_TIME_ESCAPE_SEC:
+                            dip_confirmed = True
+                            time_escape_fired = True
+                # else: pnl <= -emergency_threshold → bypass, dip_confirmed stays True
+
+                if not dip_confirmed:
+                    logger.debug(
+                        f"M4 [GRPC-{fire_reason.upper()}]: {pos.token.symbol} "
+                        f"DIP_NOT_CONFIRMED pnl={pnl_pct*100:+.1f}% — defer")
+                    continue  # transient — wait for confirmation
+
+                # Log bypass for visibility (poll-path mirror)
+                if time_escape_fired:
+                    logger.warning(
+                        f"M4 [GRPC-{fire_reason.upper()}]: {pos.token.symbol} "
+                        f"TIME-ESCAPE pnl={pnl_pct*100:+.1f}% after "
+                        f"{time.time() - pos.sl_first_breach_ts:.1f}s below "
+                        f"threshold (dead-pool fallback)")
+                elif pnl_pct <= -emergency_threshold:
+                    logger.warning(
+                        f"M4 [GRPC-{fire_reason.upper()}]: {pos.token.symbol} "
+                        f"EMERGENCY pnl={pnl_pct*100:+.1f}% "
+                        f"<= -{emergency_threshold:.0%} — bypassing dip_confirmed")
 
                 # Shadow mode: log only
                 if self.config.grpc_event_exit_shadow_only:
@@ -4916,6 +5306,20 @@ class MemeSniper(ControllerBase):
             } for r in records])
             df = df.sort_values("block_time").reset_index(drop=True)
 
+            # [M1 PROBE: P_FRESH_BASE] gRPC in-memory cache freshness
+            # Records flow from _grpc_stream._recent_swap_records (block_time, not
+            # bot DB collected_at). Measures data_age_sec = now - max(block_time).
+            try:
+                _max_bt = float(df["block_time"].max())
+                self._record_latency_event(
+                    pos.token, "m1_decision_data_lag",
+                    data_age_sec=time.time() - _max_bt,
+                    n_records=int(len(df)),
+                    source="grpc_stream_cache",
+                )
+            except Exception:
+                pass  # probe is best-effort
+
             feats = mdl.compute_all_features(df, t, grad_time)
             if feats is None:
                 return
@@ -5033,11 +5437,27 @@ class MemeSniper(ControllerBase):
             v5_3_fail_reason: Optional[str] = None
             if self.config.v5_3_exit_enabled:
                 try:
+                    # [M1 PROBE: P_FEAT_BASE + P_MODEL_BASE]
+                    # Measures total predict_14y_v5_3 latency = compute_all_features
+                    # + compute_v3_extra_features + position_state + v5_extras + load
+                    # + predict_proba (×2) + calibrate (×2). End-to-end view; offline
+                    # microbench splits this further per scripts/m1_microbench.py.
+                    _t_v5_3 = time.perf_counter()
                     v5_3_out = mdl.predict_14y_v5_3(
                         df, t, int(grad_time),
                         entry_time=int(pos.entry_time),
                         entry_price=float(pos.entry_price_sol),
                     )
+                    _v5_3_ms = (time.perf_counter() - _t_v5_3) * 1000.0
+                    try:
+                        self._record_latency_event(
+                            pos.token, "m1_v5_3_predict_total",
+                            total_ms=_v5_3_ms,
+                            n_records=int(len(df)),
+                            outcome="ok" if v5_3_out is not None else "none",
+                        )
+                    except Exception:
+                        pass
                     if v5_3_out is not None:
                         p_dd_v5_3 = float(v5_3_out["p_dd_v5_3"])
                         p_dd_v5_3_60s = float(v5_3_out["p_dd_60s"])
@@ -5108,11 +5528,25 @@ class MemeSniper(ControllerBase):
                     # Replaces v5.5.1's vulnerable last-raw-swap reads. Same 12
                     # features, same API, but swap stream is cleaned (window=30,
                     # max_ratio=3.0) before feature compute.
+                    # [M1 PROBE: P_MODEL_BASE_V55] V5.5.2 is the LIVE exit model.
+                    # The original v5_3 probe is dead code (v5_3_exit_enabled=false
+                    # since 2026-05-11). This probe replaces it on the active path.
+                    _t_v5_5 = time.perf_counter()
                     v5_5_out = mdl.predict_14y_v5_5_2(
                         df, float(t), float(grad_time),
                         entry_time=float(pos.entry_time),
                         entry_price=float(pos.entry_price_sol),
                     )
+                    _v5_5_ms = (time.perf_counter() - _t_v5_5) * 1000.0
+                    try:
+                        self._record_latency_event(
+                            pos.token, "m1_v5_5_2_predict_total",
+                            total_ms=_v5_5_ms,
+                            n_records=int(len(df)),
+                            outcome="ok" if v5_5_out is not None else "none",
+                        )
+                    except Exception:
+                        pass
                     if v5_5_out is not None:
                         p_dd_v5_5 = float(v5_5_out["p_dd_v5_5"])
                         raw_cur_pnl_v5_5 = float(v5_5_out["raw_cur_pnl"])
@@ -5180,11 +5614,25 @@ class MemeSniper(ControllerBase):
             v5_5_3_fail_reason: Optional[str] = None
             if self.config.v5_5_3_exit_enabled:
                 try:
+                    # [M1 PROBE: P_MODEL_BASE_V553] V5.5.3 SHADOW path timing.
+                    # Twin of V55_2 probe — measures shadow model overhead so
+                    # we can decide M3 cutover cost when V5.5.3 flips live.
+                    _t_v5_5_3 = time.perf_counter()
                     v5_5_3_out = mdl.predict_14y_v5_5_3(
                         df, float(t), float(grad_time),
                         entry_time=float(pos.entry_time),
                         entry_price=float(pos.entry_price_sol),
                     )
+                    _v5_5_3_ms = (time.perf_counter() - _t_v5_5_3) * 1000.0
+                    try:
+                        self._record_latency_event(
+                            pos.token, "m1_v5_5_3_predict_total",
+                            total_ms=_v5_5_3_ms,
+                            n_records=int(len(df)),
+                            outcome="ok" if v5_5_3_out is not None else "none",
+                        )
+                    except Exception:
+                        pass
                     if v5_5_3_out is not None:
                         p_dd_v5_5_3 = float(v5_5_3_out["p_dd_v5_5"])
                         raw_cur_pnl_v5_5_3 = float(v5_5_3_out["raw_cur_pnl"])
@@ -5913,6 +6361,75 @@ class MemeSniper(ControllerBase):
                 )
                 obs._rug_v4_scored = True  # don't retry on hard errors
 
+    async def _run_shadow_rug_filter_v4_3(self):
+        """T+5min shadow scoring for v4.3 cross-source-aligned (22 features).
+
+        SHADOW ONLY until shadow_rug_v4_3_shadow_only=false.
+        Logs to `shadow_rug_filter_v4_3_evals` for offline analysis.
+
+        Spec: model_specs/2026-05-13_rug_filter_v4_3_SPEC.md §14
+        """
+        if self.rug_filter_v4_3_model is None:
+            return
+        if not self.config.shadow_rug_v4_3_enabled:
+            return
+        window_s = int(self.config.shadow_rug_v4_3_window_sec)
+        now = time.time()
+        for mint, obs in list(self._observation_pool.items()):
+            grad_t = obs.token.graduation_time
+            elapsed = now - grad_t
+            if elapsed < window_s + 5:
+                continue
+            if getattr(obs, "_rug_v4_3_scored", False):
+                continue
+            try:
+                if self.db.has_shadow_rug_v4_3_eval(mint):
+                    obs._rug_v4_3_scored = True
+                    continue
+            except Exception:
+                pass
+            try:
+                db_path = self.db.db_path if hasattr(self.db, "db_path") else None
+                if not db_path:
+                    break
+                try:
+                    self._flush_swaps_to_db(mint, unregister=False)
+                except Exception as _flush_err:
+                    logger.debug(f"v4.3 pre-score flush failed: {_flush_err}")
+                result = self.rug_filter_v4_3_model.score_from_sqlite(
+                    db_path=db_path,
+                    mint_address=mint,
+                    graduation_time=grad_t,
+                )
+                self.db.record_shadow_rug_v4_3_eval(
+                    mint_address=mint,
+                    symbol=obs.token.symbol,
+                    graduation_time=grad_t,
+                    scored_at_delay_s=elapsed,
+                    window_s=window_s,
+                    n_swaps=result.n_swaps,
+                    score=(None if result.score != result.score
+                            else result.score),
+                    cutoff=self.rug_filter_v4_3_model.cutoff,
+                    decision=result.decision,
+                    reason=result.reason,
+                    features=result.features or None,
+                    model_version=self.rug_filter_v4_3_model.VERSION,
+                )
+                score_s = (f"{result.score:.4f}"
+                            if result.score == result.score else "NaN")
+                logger.info(
+                    f"RUG-V4_3-SHADOW: {obs.token.symbol} "
+                    f"score={score_s} cutoff={self.rug_filter_v4_3_model.cutoff:.4f} "
+                    f"n_swaps={result.n_swaps} decision={result.decision}"
+                )
+                obs._rug_v4_3_scored = True
+            except Exception as e:
+                logger.debug(
+                    f"RUG-V4_3-SHADOW: {obs.token.symbol} scoring failed: {e}"
+                )
+                obs._rug_v4_3_scored = True
+
     async def _run_shadow_rug_filter_v4_2(self):
         """T+5min shadow scoring for v4.2 v0.9i hybrid (raw XGB prob).
 
@@ -6550,18 +7067,53 @@ class MemeSniper(ControllerBase):
                 quote_task.cancel()
 
         # === Check 1: live GMGN snapshot ===
+        # P_SNAPSHOT_RETRY (2026-05-15): 48% of preflight rejections are
+        # `live_market_snapshot_unavailable`. Add a single 300ms backoff retry
+        # to recover from GMGN rate-limit / indexing-delay transients.
+        # Measurement events drive Step B decision: if retry_recovered ≥ 30%
+        # of first-fail cases → keep; if < 10% → revert + run P_SNAPSHOT_DIAG.
+        SNAPSHOT_RETRY_BACKOFF_SEC = 0.3
         try:
             snapshot = await snapshot_task
         except Exception as e:
             logger.debug(f"M3: snapshot fetch error for {token.symbol}: {e}")
             snapshot = None
+        snapshot_retry_recovered = False
+        if not snapshot and self.config.require_live_market_snapshot:
+            try:
+                self._record_latency_event(
+                    token, "snapshot_retry_attempted",
+                    backoff_ms=int(SNAPSHOT_RETRY_BACKOFF_SEC * 1000))
+            except Exception:
+                pass
+            await asyncio.sleep(SNAPSHOT_RETRY_BACKOFF_SEC)
+            try:
+                snapshot = await self.discovery.get_token_market_snapshot(token.mint_address)
+            except Exception as e:
+                logger.debug(f"M3: snapshot retry error for {token.symbol}: {e}")
+                snapshot = None
+            if snapshot:
+                snapshot_retry_recovered = True
+                try:
+                    self._record_latency_event(
+                        token, "snapshot_retry_recovered",
+                        backoff_ms=int(SNAPSHOT_RETRY_BACKOFF_SEC * 1000))
+                except Exception:
+                    pass
+                logger.info(f"M3: [SNAPSHOT RETRY OK] {token.symbol} — recovered on attempt 2")
+            else:
+                try:
+                    self._record_latency_event(token, "snapshot_retry_failed")
+                except Exception:
+                    pass
         if self.config.require_live_market_snapshot and not snapshot:
             reason = "live_market_snapshot_unavailable"
             logger.warning(f"M3: [BUY BLOCKED] {token.symbol} — {reason}")
             _cancel_quote()
             return False, None, reason, {}
         logger.info(f"M3: [CHECK 1/7] {token.symbol} live_snapshot ✓ "
-                    f"(symbol={snapshot.get('symbol','?') if snapshot else 'N/A'})")
+                    f"(symbol={snapshot.get('symbol','?') if snapshot else 'N/A'}"
+                    f"{' / via retry' if snapshot_retry_recovered else ''})")
 
         effective_liq = token.liquidity_usd if token.liquidity_usd > 0 else 0.0
         if snapshot:
@@ -6978,6 +7530,9 @@ class MemeSniper(ControllerBase):
                 self._record_latency_event(token, "buy_preflight_fail", reject_reason=reject_reason)
                 self.db.record_event("WARN", "buy",
                                      f"BUY BLOCKED {token.symbol}: {reject_reason}")
+                # 2026-05-14: stash on candidate so queue loop can pick a
+                # class-aware retry backoff (soft/hard/terminal).
+                candidate.buy_last_fail_reason = reject_reason
                 return False
             self._record_latency_event(token, "buy_preflight_pass", **preflight_meta)
 
@@ -7250,6 +7805,96 @@ class MemeSniper(ControllerBase):
             else:
                 current_price = None
                 price_source = None
+
+            # === VWMP override (2026-05-15) ===
+            # Replace current_price with Volume-Weighted Median Price over the
+            # last 5s if available. VWMP is computed from the same gRPC swap
+            # stream that feeds pool_px but uses a median-of-many-swaps
+            # statistic instead of a 1-block reserve snapshot — phantom-resistant
+            # for MEV/sandwich/partial-fill states.
+            # Keeps price_source == "grpc_pool" for downstream quality-gate
+            # compatibility (VWMP is still pool-derived data).
+            # Gates on `price_source == "grpc_pool"` (line below) by design —
+            # if gRPC stream is down and bot is on jupiter_fallback, VWMP
+            # cannot apply (no swap buffer). In that degraded mode, Phantom
+            # Guard also cannot help (it gates only on grpc_pool path). User
+            # accepts that jupiter_fallback is unprotected from phantoms;
+            # spec §3.3 / §5.4 calls this out (Q3 fallback-open decision).
+            # Spec §3-§5 in research_notebooks/meme_sniper/vwmp_price_defense/
+            vwmp_diag = None
+            vwmp_active = False
+            if (self.config.vwmp_enabled
+                    and HAS_VWMP
+                    and pool_px is not None
+                    and price_source == "grpc_pool"
+                    and getattr(self, "_grpc_stream", None) is not None
+                    and hasattr(self._grpc_stream, "get_recent_swap_records")):
+                try:
+                    # Pull from existing per-mint buffer (no extra state needed).
+                    # 2× window for headroom — get_recent_swap_records filters
+                    # by max_age_sec, compute_vwmp then filters by window_s.
+                    records = self._grpc_stream.get_recent_swap_records(
+                        mint, max_age_sec=self.config.vwmp_window_s * 2.0)
+                    if records:
+                        swap_tuples = [
+                            (r.timestamp, r.price_sol, r.volume_sol)
+                            for r in records
+                        ]
+                        vwmp_price, vwmp_diag = compute_vwmp_with_diagnostics(
+                            swap_tuples,
+                            vol_gate=self.config.vwmp_vol_gate_sol,
+                            window_s=self.config.vwmp_window_s,
+                            min_swaps=self.config.vwmp_min_swaps,
+                        )
+                        if vwmp_price is not None and vwmp_price > 0:
+                            current_price = vwmp_price
+                            vwmp_active = True
+                            pos.last_vwmp_price = vwmp_price
+                            pos.last_vwmp_ts = time.time()
+                            if pos.vwmp_fallback_count > 0:
+                                # Recovered from fallback streak
+                                pos.vwmp_fallback_count = 0
+                        else:
+                            pos.vwmp_fallback_count += 1
+                            if pos.vwmp_fallback_count == self.config.vwmp_fallback_alert_count:
+                                logger.warning(
+                                    f"M4: {pos.token.symbol} — VWMP fallback "
+                                    f"{pos.vwmp_fallback_count}x consecutive "
+                                    f"(status={(vwmp_diag or {}).get('vwmp_status', '?')}, "
+                                    f"qualified={(vwmp_diag or {}).get('qualified_count', 0)}). "
+                                    f"Using grpc_pool snapshot.")
+                except Exception as _vwmp_e:
+                    # Defensive — never let VWMP break M4 monitor loop
+                    logger.debug(
+                        f"M4: {pos.token.symbol} VWMP compute skipped: {_vwmp_e}")
+
+            # VWMP shadow log: write paired (vwmp, grpc_pool) data per tick for
+            # first 24h post-deploy validation. Disable yml flag after that.
+            # Skip log if pool_px is None (would have nothing to compare).
+            if (self.config.vwmp_shadow_log_enabled
+                    and pool_px is not None
+                    and hasattr(self, "db")):
+                try:
+                    entry_sol = pos.entry_price_sol or 0.0
+                    grpc_pnl = ((pool_px / entry_sol) - 1.0) if entry_sol > 0 else None
+                    vwmp_pnl = ((pos.last_vwmp_price / entry_sol) - 1.0
+                                if (pos.last_vwmp_price and entry_sol > 0)
+                                else None)
+                    self.db.log_vwmp_shadow(
+                        timestamp=time.time(),
+                        mint_address=mint,
+                        grpc_price=pool_px,
+                        vwmp_price=pos.last_vwmp_price if vwmp_active else None,
+                        vwmp_buffer_size=(vwmp_diag or {}).get('buffer_size'),
+                        vwmp_qualified_count=(vwmp_diag or {}).get('qualified_count'),
+                        vwmp_status=(vwmp_diag or {}).get('vwmp_status'),
+                        grpc_pnl_pct=grpc_pnl,
+                        vwmp_pnl_pct=vwmp_pnl,
+                        price_source_used=("vwmp" if vwmp_active else "grpc_pool_fallback"),
+                    )
+                except Exception:
+                    # Never fail M4 loop for logging
+                    pass
 
             # Forensic log: every monitor cycle, write both prices so BK-type
             # divergences can be reconstructed post-hoc. Skip if we have zero
@@ -7725,47 +8370,75 @@ class MemeSniper(ControllerBase):
             # Use sandwich-filtered max from gRPC swap record buffer instead.
             _pos_dirty = False
             current_poll_peak_updated = False
-            # B5 fix 2026-05-14: maintain TWO peaks:
+            # B5 fix 2026-05-14 + Phantom Guard 2026-05-15: maintain TWO peaks:
             #   peak_pnl_pct       — observed peak (poll OR stream sandwich-max)
             #                        used only for trailing ACTIVATION
-            #   peak_pnl_pct_poll  — executable peak (poll-observed only)
-            #                        used for trailing drop calculation
+            #   peak_pnl_pct_poll  — executable peak (poll-observed only, with
+            #                        stream-confirmation gate, used for trailing
+            #                        drop calculation AND TP gate)
             # Prior version overwrote peak_pnl_pct with stream sandwich-max,
             # which captures spikes the bot's price-poll never saw. Trail then
             # fired drop_from_peak against a price the bot couldn't execute
             # against — live audit (7d, n=56 trailing) showed avg 32pp late.
-            if price_source == "grpc_pool" and pnl_pct > pos.peak_pnl_pct:
-                pos.peak_pnl_pct = pnl_pct
-                _pos_dirty = True
-                current_poll_peak_updated = True
-            if price_source == "grpc_pool" and pnl_pct > pos.peak_pnl_pct_poll:
-                pos.peak_pnl_pct_poll = pnl_pct
-                _pos_dirty = True
+            # Phantom Guard adds: even poll-observed peaks need stream confirmation
+            # to filter pool-snapshot 1-block phantoms (May 13 audit: 4/5 TPs
+            # fired on phantom states with peak_stream=0-13% but trigger=+100%+).
 
-            # Sandwich-filtered max from raw swap stream feeds peak_pnl_pct
-            # ONLY — used to activate trailing earlier on spikes the bot's
-            # price feed missed. It does NOT feed peak_pnl_pct_poll, so drop
-            # calculations stay anchored to executable poll-observed peaks.
+            # Query stream peak ONCE per tick (sandwich-filtered, real-trade-only)
+            stream_peak_pnl = None
             try:
                 stream = getattr(self, "_grpc_stream", None)
                 if stream is not None and hasattr(stream, "get_peak_price_since"):
                     peak_px = stream.get_peak_price_since(
                         mint, since_ts=pos.entry_time)
                     if peak_px is not None and pos.entry_price_sol > 0:
-                        peak_pnl_from_stream = (peak_px - pos.entry_price_sol) / pos.entry_price_sol
-                        if peak_pnl_from_stream > pos.peak_pnl_pct:
-                            old_peak = pos.peak_pnl_pct
-                            pos.peak_pnl_pct = peak_pnl_from_stream
-                            _pos_dirty = True
-                            if not current_poll_peak_updated:
-                                logger.info(
-                                    f"M4: {pos.token.symbol} — peak raised by stream "
-                                    f"({old_peak:+.2%} → {peak_pnl_from_stream:+.2%}, "
-                                    f"current poll pnl={pnl_pct:+.2%}, "
-                                    f"poll_peak={pos.peak_pnl_pct_poll:+.2%})")
+                        stream_peak_pnl = (peak_px - pos.entry_price_sol) / pos.entry_price_sol
             except Exception as _b5_e:
-                # Defensive — never let B5 fix break monitor loop
-                logger.debug(f"M4: {pos.token.symbol} B5 peak-from-stream skipped: {_b5_e}")
+                # Defensive — never let stream query break monitor loop
+                logger.debug(f"M4: {pos.token.symbol} stream peak query skipped: {_b5_e}")
+
+            # Update peak_pnl_pct (display peak; used for trail activation only).
+            # Both poll and stream feed this — no phantom gate here because trail
+            # activation triggers at much lower threshold (+20%) and phantom
+            # activation is harmless (still need real-trade drop_from_peak to fire).
+            if price_source == "grpc_pool" and pnl_pct > pos.peak_pnl_pct:
+                pos.peak_pnl_pct = pnl_pct
+                _pos_dirty = True
+                current_poll_peak_updated = True
+            if stream_peak_pnl is not None and stream_peak_pnl > pos.peak_pnl_pct:
+                old_peak = pos.peak_pnl_pct
+                pos.peak_pnl_pct = stream_peak_pnl
+                _pos_dirty = True
+                if not current_poll_peak_updated:
+                    logger.info(
+                        f"M4: {pos.token.symbol} — peak raised by stream "
+                        f"({old_peak:+.2%} → {stream_peak_pnl:+.2%}, "
+                        f"current poll pnl={pnl_pct:+.2%}, "
+                        f"poll_peak={pos.peak_pnl_pct_poll:+.2%})")
+
+            # === EXECUTABLE peak (poll-observed, gated by stream confirmation) ===
+            # Used by trail-drop and TP-gate calculations — must be REAL.
+            if price_source == "grpc_pool" and pnl_pct > pos.peak_pnl_pct_poll:
+                ratio = self.config.poll_peak_stream_confirm_ratio
+                if ratio <= 0.0:
+                    # Guard disabled — preserve legacy behavior
+                    pos.peak_pnl_pct_poll = pnl_pct
+                    _pos_dirty = True
+                else:
+                    min_stream_required = pnl_pct * ratio
+                    # Pass if stream confirms (or stream unavailable — degrade OPEN)
+                    if stream_peak_pnl is None or stream_peak_pnl >= min_stream_required:
+                        pos.peak_pnl_pct_poll = pnl_pct
+                        _pos_dirty = True
+                    else:
+                        # Phantom: stream did NOT see comparable level. Skip update.
+                        pos._phantom_skip_count = getattr(pos, '_phantom_skip_count', 0) + 1
+                        logger.info(
+                            f"M4: {pos.token.symbol} — poll-peak update SKIPPED "
+                            f"(phantom guard, count={pos._phantom_skip_count}) "
+                            f"poll_pnl={pnl_pct:+.2%} would raise poll_peak from "
+                            f"{pos.peak_pnl_pct_poll:+.2%} but stream={stream_peak_pnl:+.2%} "
+                            f"< required {min_stream_required:+.2%} (ratio={ratio:.0%})")
 
             # Trailing activation: by EITHER current pnl OR (B5 fix) historical
             # peak. Without the peak-based path, B5's raised peak is silently
@@ -7901,13 +8574,12 @@ class MemeSniper(ControllerBase):
             if tx_status == 0:
                 self._record_latency_event(
                     pos.token, "sell_onchain_fail", reason=reason, tx_hash=tx_hash)
-                fails = self._sell_retry_count.get(mint, 0) + 1
-                self._sell_retry_count[mint] = fails
-                urgent = reason in ("stop_loss", "trailing_stop")
-                backoff = min(5 * fails, 20) if urgent else min(30 * (2 ** (fails - 1)), 300)
-                self._sell_retry_after[mint] = time.time() + backoff
+                abandoned, fails, backoff = self._schedule_sell_retry(
+                    pos, reason, context=f"status=0 tx={tx_hash}")
+                if abandoned:
+                    return
                 logger.error(f"M3: [SELL FAILED ON-CHAIN] {pos.token.symbol} — tx={tx_hash} "
-                             f"status=0, retry in {backoff}s (attempt #{fails})")
+                             f"status=0, retry in {backoff:.0f}s (attempt #{fails})")
                 self.db.record_event("ERROR", "sell",
                                      f"SELL ON-CHAIN FAIL {pos.token.symbol} reason={reason} tx={tx_hash}")
                 return
@@ -7921,13 +8593,12 @@ class MemeSniper(ControllerBase):
             if sol_received <= 0:
                 self._record_latency_event(
                     pos.token, "sell_zero_output", reason=reason, tx_hash=tx_hash)
-                fails = self._sell_retry_count.get(mint, 0) + 1
-                self._sell_retry_count[mint] = fails
-                urgent = reason in ("stop_loss", "trailing_stop")
-                backoff = min(5 * fails, 20) if urgent else min(30 * (2 ** (fails - 1)), 300)
-                self._sell_retry_after[mint] = time.time() + backoff
+                abandoned, fails, backoff = self._schedule_sell_retry(
+                    pos, reason, context=f"zero output tx={tx_hash}")
+                if abandoned:
+                    return
                 logger.error(f"M3: [SELL SUSPICIOUS] {pos.token.symbol} — sol_received=0, "
-                             f"retry in {backoff}s (attempt #{fails})")
+                             f"retry in {backoff:.0f}s (attempt #{fails})")
                 self.db.record_event("ERROR", "sell",
                                      f"SELL 0-RECEIVED {pos.token.symbol} reason={reason} tx={tx_hash}")
                 return
@@ -8019,12 +8690,13 @@ class MemeSniper(ControllerBase):
 
         except Exception as e:
             self._record_latency_event(pos.token, "sell_exception", reason=reason, error=str(e))
-            fails = self._sell_retry_count.get(mint, 0) + 1
-            self._sell_retry_count[mint] = fails
-            urgent = reason in ("stop_loss", "trailing_stop")
-            backoff = min(5 * fails, 20) if urgent else min(30 * (2 ** (fails - 1)), 300)
-            self._sell_retry_after[mint] = time.time() + backoff
             err_str = str(e)
+            abandoned, fails, backoff = self._schedule_sell_retry(
+                pos, reason, context=f"exception: {err_str[:60]}")
+            if abandoned:
+                # Phase 16.3 Step 3 audit fix — release sell-in-progress mutex
+                self._sell_in_progress.discard(mint)
+                return
 
             # ========== BUG 2 FIX (2026-04-30): post-error wallet verification ==========
             # Gateway sometimes returns 400 "Transaction simulation failed" while the
@@ -8065,14 +8737,14 @@ class MemeSniper(ControllerBase):
                     logger.warning(
                         f"M3: [SELL FAIL] {pos.token.symbol} — Gateway 'Token not found', "
                         f"auto-reregistered ({reg_resp.get('message', 'OK')}); "
-                        f"retry in {backoff}s")
+                        f"retry in {backoff:.0f}s")
                     self._sell_retry_after[mint] = time.time() + min(backoff, 30)
                 except Exception as reg_err:
                     logger.error(
                         f"M3: [SELL FAIL] {pos.token.symbol}: {e} + re-register failed: "
-                        f"{reg_err} — retry in {backoff}s (attempt #{fails})")
+                        f"{reg_err} — retry in {backoff:.0f}s (attempt #{fails})")
             else:
-                logger.error(f"M3: [SELL FAIL] {pos.token.symbol}: {e} — retry in {backoff}s (attempt #{fails})")
+                logger.error(f"M3: [SELL FAIL] {pos.token.symbol}: {e} — retry in {backoff:.0f}s (attempt #{fails})")
             self.db.record_event("ERROR", "sell", f"SELL FAIL {pos.token.symbol}: {e}")
         finally:
             # Phase 16.3 Step 3 audit fix — release sell-in-progress mutex

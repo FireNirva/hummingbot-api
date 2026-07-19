@@ -1,4 +1,20 @@
 services:
+  dashboard:
+    container_name: dashboard
+    image: hummingbot/dashboard:latest
+    ports:
+      - "8501:8501"
+    environment:
+        - AUTH_SYSTEM_ENABLED=False
+        - BACKEND_API_HOST=hummingbot-api
+        - BACKEND_API_PORT=8000
+        - BACKEND_API_USERNAME=${USERNAME}
+        - BACKEND_API_PASSWORD=${PASSWORD}
+    volumes:
+      - ./dashboard-credentials.yml:/home/dashboard/credentials.yml
+      - ./pages:/home/dashboard/pages
+    networks:
+        - emqx-bridge
   hummingbot-api:
     container_name: hummingbot-api
     image: hummingbot/hummingbot-api:latest
@@ -13,12 +29,10 @@ services:
       # Override specific values for Docker networking
       - BROKER_HOST=emqx
       - DATABASE_URL=postgresql+asyncpg://hbot:hummingbot-api@postgres:5432/hummingbot_api
-      - GATEWAY_URL=http://host.docker.internal:15888
-    extra_hosts:
-      # Map host.docker.internal to host gateway for Linux compatibility
-      # On macOS/Windows, Docker Desktop provides this automatically
-      # On Linux, this maps to the docker bridge gateway IP
-      - "host.docker.internal:host-gateway"
+      # GATEWAY_URL is read from .env file
+      # For local dev: http://host.docker.internal:15888 (Docker Desktop)
+      # For remote deployment: http://<gateway_tailscale_ip>:15888
+      - GATEWAY_URL=${GATEWAY_URL:-http://host.docker.internal:15888}
     networks:
       - emqx-bridge
     depends_on:
@@ -70,7 +84,7 @@ services:
       # Init script as safety net - only runs on first initialization
       - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
     ports:
-      - "5432:5432"
+      - "5433:5432"
     networks:
       - emqx-bridge
     healthcheck:

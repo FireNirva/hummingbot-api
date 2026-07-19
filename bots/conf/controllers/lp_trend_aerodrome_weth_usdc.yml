@@ -5,6 +5,7 @@ controller_type: generic
 # Pool configuration — Aerodrome Slipstream WETH/USDC 0.05% on Base
 # tickSpacing=100, dynamic fee (~0.06%), AERO gauge rewards
 connector_name: aerodrome/clmm
+network: base
 trading_pair: WETH-USDC
 pool_address: "0xb2cc224c1c9fee385f8ad6a55b4d94e92359dc59"
 

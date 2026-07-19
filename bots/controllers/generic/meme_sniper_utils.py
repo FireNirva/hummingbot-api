@@ -56,6 +56,22 @@ PUMPSWAP_CREATE_POOL_DISC = bytes([233, 146, 209, 142, 207, 104, 64, 188])
 PUMPSWAP_BUY_DISC = bytes([102, 6, 61, 18, 1, 218, 235, 234])
 PUMPSWAP_SELL_DISC = bytes([51, 230, 133, 164, 1, 127, 131, 173])
 
+
+def _coerce_price(v) -> float:
+    """Tolerant float() for GMGN price fields.
+
+    GMGN /v1/token/info changed `price` from a flat str/number to a nested
+    dict {"address": ..., "price": "0.000053", "price_1m": ..., ...}
+    (observed 2026-05-14). When v is a dict, extract the inner "price";
+    otherwise coerce as usual. Returns 0.0 on any failure.
+    """
+    if isinstance(v, dict):
+        v = v.get("price") or v.get("usd_price") or 0
+    try:
+        return float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
 # Inline base58 decoder (avoids external dependency in Docker container)
 _B58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 def _b58decode(s: str) -> bytes:
@@ -307,6 +323,10 @@ class TradeCandidate:
     last_swap_price_sol: float = 0.0  # cached at M2 time before flush, used by M3 double-check
     buy_fail_count: int = 0
     buy_last_fail_time: float = 0.0
+    # 2026-05-14: track last failure reason so retry backoff can be
+    # tailored by failure class (soft = AMM jitter → retry fast,
+    # hard = upstream API down → exp backoff, terminal = give up).
+    buy_last_fail_reason: str = ""
     # Phase 16.3 Step 3 — entry-source tracking + per-source sizing override.
     # entry_source: "" (legacy = vshape/p11), "big_winner_v2", future strategies.
     # position_size_usd: None falls back to config.position_size_usd at buy time.
@@ -371,6 +391,17 @@ class Position:
     slippage_per_pool_ratio: Optional[float] = None
     # Entry-source tracking ("vshape" / "big_winner_v2" / "")
     entry_source: str = ""
+
+    # VWMP 2026-05-15 (in-memory only, NOT persisted to DB — buffer in
+    # geyser_stream._recent_swap_records is rebuilt from gRPC stream on restart):
+    # - last_vwmp_price: most recent VWMP computed value (or None if fallback)
+    # - last_vwmp_ts: when last computed (for staleness check in shadow log)
+    # - vwmp_fallback_count: consecutive M4 ticks that fell back to grpc_pool
+    #   (resets to 0 when VWMP successfully computed). Used for the
+    #   vwmp_fallback_alert_count threshold check.
+    last_vwmp_price: Optional[float] = None
+    last_vwmp_ts: Optional[float] = None
+    vwmp_fallback_count: int = 0
 
     def hold_seconds(self) -> float:
         return time.time() - self.entry_time
@@ -1502,7 +1533,7 @@ class TokenDiscovery:
                 return self._FILTERED_OUT
 
         name = token_data.get("name", symbol)
-        price = float(token_data.get("price", 0) or 0)
+        price = _coerce_price(token_data.get("price"))
 
         return GraduatedToken(
             mint_address=grad.mint,
@@ -1567,7 +1598,7 @@ class TokenDiscovery:
                 decimals=6,
                 graduation_time=float(item.get("open_timestamp") or item.get("creation_timestamp") or now),
                 liquidity_usd=liquidity,
-                price_usd=float(item.get("price", 0) or 0),
+                price_usd=_coerce_price(item.get("price")),
                 swaps_24h=int(item.get("swaps_24h", 0) or 0),
                 buys_24h=int(item.get("buys_24h", 0) or 0),
                 sells_24h=int(item.get("sells_24h", 0) or 0),
@@ -1815,7 +1846,7 @@ class TokenDiscovery:
             return {
                 "symbol": token_data.get("symbol", ""),
                 "liquidity_usd": real_liq,
-                "price_usd": float(token_data.get("price", 0) or 0),
+                "price_usd": _coerce_price(token_data.get("price")),
                 "biggest_pool_address": token_data.get("biggest_pool_address"),
                 "top_10_holder_rate": float(stat.get("top_10_holder_rate", 0) or 0),
             }
@@ -1997,7 +2028,7 @@ class TokenDiscovery:
                 decimals=6,
                 graduation_time=open_ts,
                 liquidity_usd=liquidity,
-                price_usd=float(item.get("price", 0) or 0),
+                price_usd=_coerce_price(item.get("price")),
                 pool_address=None,
                 source="trending",
                 _gmgn_info_raw=item,
@@ -4881,6 +4912,63 @@ class TradeDB:
         "CREATE INDEX IF NOT EXISTS idx_shadow_rugv4_2_grad ON shadow_rug_filter_v4_2_evals(graduation_time)",
     ]
 
+    # Rug filter v4.3 — cross-source-aligned retrain (22 features after G_micro).
+    # Spec: model_specs/2026-05-13_rug_filter_v4_3_SPEC.md §14
+    DDL_SHADOW_RUG_V4_3_EVALS = """
+    CREATE TABLE IF NOT EXISTS shadow_rug_filter_v4_3_evals (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp          REAL    NOT NULL,
+        mint_address       TEXT    NOT NULL,
+        symbol             TEXT,
+        graduation_time    REAL,
+        scored_at_delay_s  REAL,
+        window_s           INTEGER,
+        n_swaps            INTEGER,
+        score              REAL,
+        cutoff             REAL,
+        decision           TEXT,
+        reason             TEXT,
+        features           TEXT,
+        model_version      TEXT,
+        actual_pnl_usd     REAL,
+        actual_exit_reason TEXT,
+        actual_rug         INTEGER,
+        resolver_ran_at    REAL
+    )
+    """
+    DDL_SHADOW_RUG_V4_3_EVALS_IDX = [
+        "CREATE INDEX IF NOT EXISTS idx_shadow_rugv4_3_mint ON shadow_rug_filter_v4_3_evals(mint_address)",
+        "CREATE INDEX IF NOT EXISTS idx_shadow_rugv4_3_ts ON shadow_rug_filter_v4_3_evals(timestamp)",
+        "CREATE INDEX IF NOT EXISTS idx_shadow_rugv4_3_grad ON shadow_rug_filter_v4_3_evals(graduation_time)",
+    ]
+
+    # VWMP shadow log 2026-05-15 — paired (vwmp_price, grpc_price) data
+    # for post-hoc validation that VWMP correctly filters phantoms vs the
+    # legacy grpc_pool snapshot. Written every M4 tick for every open
+    # position when vwmp_shadow_log_enabled=true. Disable after 24h to
+    # save DB space.
+    # Spec: research_notebooks/meme_sniper/vwmp_price_defense/
+    #       2026-05-15_vwmp_price_source_SPEC.md §5.2
+    DDL_VWMP_SHADOW_LOG = """
+    CREATE TABLE IF NOT EXISTS vwmp_shadow_log (
+        id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp             REAL    NOT NULL,
+        mint_address          TEXT    NOT NULL,
+        grpc_price            REAL,
+        vwmp_price            REAL,
+        vwmp_buffer_size      INTEGER,
+        vwmp_qualified_count  INTEGER,
+        vwmp_status           TEXT,
+        grpc_pnl_pct          REAL,
+        vwmp_pnl_pct          REAL,
+        price_source_used     TEXT
+    )
+    """
+    DDL_VWMP_SHADOW_LOG_IDX = [
+        "CREATE INDEX IF NOT EXISTS idx_vwmp_shadow_mint ON vwmp_shadow_log(mint_address)",
+        "CREATE INDEX IF NOT EXISTS idx_vwmp_shadow_ts ON vwmp_shadow_log(timestamp)",
+    ]
+
     # Phase B shadow: event-triggered first-trigger log. One row per (mint,
     # scan_t) where (pattern AND score >= cutoff). Offline analysis joins
     # against swaps table to reconstruct hypothetical PnL.
@@ -5238,6 +5326,12 @@ class TradeDB:
                 self._conn.execute(idx_stmt)
             self._conn.execute(self.DDL_SHADOW_RUG_V4_2_EVALS)
             for idx_stmt in self.DDL_SHADOW_RUG_V4_2_EVALS_IDX:
+                self._conn.execute(idx_stmt)
+            self._conn.execute(self.DDL_SHADOW_RUG_V4_3_EVALS)
+            for idx_stmt in self.DDL_SHADOW_RUG_V4_3_EVALS_IDX:
+                self._conn.execute(idx_stmt)
+            self._conn.execute(self.DDL_VWMP_SHADOW_LOG)
+            for idx_stmt in self.DDL_VWMP_SHADOW_LOG_IDX:
                 self._conn.execute(idx_stmt)
             self._conn.execute(self.DDL_SHADOW_V5_3_EVALS)
             for idx_stmt in self.DDL_SHADOW_V5_3_EVALS_IDX:
@@ -6363,7 +6457,11 @@ class TradeDB:
 
     # ===== v4.2 v0.9i hybrid shadow methods =====
     def has_shadow_rug_v4_2_eval(self, mint_address: str) -> bool:
-        rows = self._execute_fetch(
+        # 2026-05-14: was `_execute_fetch` which doesn't exist on TradeDB.
+        # The bug was silently swallowed by an outer try/except, causing every
+        # mint to look "unseen" so the heartbeat re-scored each tick (idempotent
+        # at the SQL level via has_*_eval skip-list, but pointless work).
+        rows = self._fetchall(
             "SELECT 1 FROM shadow_rug_filter_v4_2_evals WHERE mint_address = ? LIMIT 1",
             (mint_address,))
         return bool(rows)
@@ -6390,6 +6488,91 @@ class TradeDB:
              float(cutoff), decision, reason,
              json.dumps(features) if features else None,
              model_version))
+
+    # ===== v4.3 cross-source-aligned shadow methods =====
+    def has_shadow_rug_v4_3_eval(self, mint_address: str) -> bool:
+        # 2026-05-14: was `_execute_fetch` (non-existent method) — same bug
+        # as v4.2 had_*_eval. Outer try/except swallowed the AttributeError
+        # silently, so it appeared to work but every call returned False.
+        rows = self._fetchall(
+            "SELECT 1 FROM shadow_rug_filter_v4_3_evals WHERE mint_address = ? LIMIT 1",
+            (mint_address,))
+        return bool(rows)
+
+    def get_latest_shadow_rug_v4_3_eval(self, mint_address: str) -> Optional[Dict[str, Any]]:
+        """Fetch most recent v4.3 eval for a mint (used by hard-gate check).
+
+        Returns dict {score, cutoff, decision, n_swaps, timestamp} or None if
+        no eval exists yet (heartbeat hasn't scored this mint yet).
+        """
+        rows = self._fetchall(
+            """SELECT score, cutoff, decision, n_swaps, timestamp
+               FROM shadow_rug_filter_v4_3_evals
+               WHERE mint_address = ?
+               ORDER BY timestamp DESC LIMIT 1""",
+            (mint_address,))
+        if not rows:
+            return None
+        score, cutoff, decision, n_swaps, ts = rows[0]
+        return {
+            "score": score,
+            "cutoff": cutoff,
+            "decision": decision,
+            "n_swaps": n_swaps,
+            "timestamp": ts,
+        }
+
+    def record_shadow_rug_v4_3_eval(self, *, mint_address: str, symbol: Optional[str],
+                                      graduation_time: Optional[float],
+                                      scored_at_delay_s: Optional[float],
+                                      window_s: int, n_swaps: int,
+                                      score: Optional[float],
+                                      cutoff: float,
+                                      decision: str, reason: str,
+                                      features: Optional[Dict],
+                                      model_version: Optional[str]):
+        """Log v4.3 cross-source-aligned T+5min shadow score (22 features)."""
+        self._execute_commit(
+            """INSERT INTO shadow_rug_filter_v4_3_evals
+               (timestamp, mint_address, symbol, graduation_time,
+                scored_at_delay_s, window_s, n_swaps, score,
+                cutoff, decision, reason, features, model_version)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (time.time(), mint_address, symbol, graduation_time,
+             scored_at_delay_s, int(window_s), int(n_swaps),
+             float(score) if score is not None and score == score else None,
+             float(cutoff), decision, reason,
+             json.dumps(features) if features else None,
+             model_version))
+
+    def log_vwmp_shadow(self, *, timestamp: float, mint_address: str,
+                          grpc_price: Optional[float],
+                          vwmp_price: Optional[float],
+                          vwmp_buffer_size: Optional[int],
+                          vwmp_qualified_count: Optional[int],
+                          vwmp_status: Optional[str],
+                          grpc_pnl_pct: Optional[float],
+                          vwmp_pnl_pct: Optional[float],
+                          price_source_used: str):
+        """Log paired (vwmp, grpc) price observation for post-hoc validation.
+        Spec §5.2: vwmp_shadow_log table. Written per M4 tick when
+        vwmp_shadow_log_enabled=true (disable after 24h to save space).
+        """
+        self._execute_commit(
+            """INSERT INTO vwmp_shadow_log
+               (timestamp, mint_address, grpc_price, vwmp_price,
+                vwmp_buffer_size, vwmp_qualified_count, vwmp_status,
+                grpc_pnl_pct, vwmp_pnl_pct, price_source_used)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (float(timestamp), mint_address,
+             float(grpc_price) if grpc_price is not None else None,
+             float(vwmp_price) if vwmp_price is not None else None,
+             int(vwmp_buffer_size) if vwmp_buffer_size is not None else None,
+             int(vwmp_qualified_count) if vwmp_qualified_count is not None else None,
+             vwmp_status,
+             float(grpc_pnl_pct) if grpc_pnl_pct is not None else None,
+             float(vwmp_pnl_pct) if vwmp_pnl_pct is not None else None,
+             price_source_used))
 
     def record_shadow_event_eval(self, *, mint_address: str, symbol: Optional[str],
                                   graduation_time: Optional[float],
