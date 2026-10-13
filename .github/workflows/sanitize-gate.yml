@@ -1,0 +1,9 @@
+name: sanitize-gate
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+jobs:
+  gate:
+    uses: FireNirva/sanitize-gate/.github/workflows/scan.yml@main
