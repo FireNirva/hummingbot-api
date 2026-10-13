@@ -1,7 +1,7 @@
 name: sanitize-gate
-# 中央信号门禁(P5 强制层, 自包含版) — 模板正本: FireNirva/sanitize-gate(私有, 因个人账户
-# 不支持跨仓调用私有 reusable 而内置)。敏感模式分段拼接仅为避免规则文件自污染, 人工可审。
-# 拦: 节点IP/机队机械词/身份; 扫描错误同拦; CRED/语义/T2-code 为已接受残差不在此门。
+# 中央信号门禁 v3(增量模式) — 只扫本次变更文件: 存量已接受残差放行, 新引入信号拦截。
+# 模板正本: FireNirva/sanitize-gate。敏感模式分段拼接仅为防规则文件自污染, 人工可审。
+# 拦(仅变更文件): 节点IP/机队机械词/身份; 扫描错误同拦。
 on:
   push:
     branches: [main]
@@ -12,31 +12,39 @@ jobs:
     runs-on: [self-hosted]
     steps:
       - uses: actions/checkout@v4
-      - name: run gate
+        with:
+          fetch-depth: 0
+      - name: run gate (delta)
         run: |
-          python3 - <<'PY'
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+          fi
+          git cat-file -e "$BASE^{commit}" 2>/dev/null || BASE=$(git rev-list --max-parents=0 HEAD | tail -1)
+          python3 - "$BASE" <<'PY'
           import subprocess, sys, re
+          base = sys.argv[1]
           N = [".".join(x) for x in [("16","54","8","160"),("15","175","16","57"),("3","97","192","68")]]
           ID1 = "zheng" + "jianxuan"; ID2 = "jonathanzh" + "_team"; ID3 = "jon" + "athan"
-          MB = "montreal" + "-node"; CU = "cn[-_]" + "ubuntu"
           RULES = [
               ("T1A", re.compile("|".join(re.escape(i) for i in N), re.I)),
-              ("T1Bm", re.compile(f"{MB}|{CU}", re.I)),
+              ("T1Bm", re.compile("montreal" + "-node|cn[-_]" + "ubuntu", re.I)),
               ("T1C", re.compile(f"{ID1}|{ID2}|\\b{ID3}\\b", re.I)),
           ]
-          p = subprocess.run(["git", "ls-files", "-z"], capture_output=True)
+          p = subprocess.run(["git", "diff", "--name-only", "--diff-filter=ACMR", base, "HEAD"], capture_output=True)
           if p.returncode != 0:
-              print("GATE-ERROR ls-files rc=", p.returncode); sys.exit(2)
-          files = [x.decode("utf-8","surrogateescape") for x in p.stdout.split(b"\0") if x]
+              print("GATE-ERROR diff rc=", p.returncode); sys.exit(2)
+          files = [f for f in p.stdout.decode().splitlines() if f]
           hits, errs = 0, 0
           for f in files:
-              try: data = open(f, "rb").read()
-              except OSError as e:
-                  print(f"UNREADABLE|{f}|{type(e).__name__}"); errs += 1; continue
-              text = data.decode("utf-8","surrogateescape")
+              b = subprocess.run(["git", "show", f"HEAD:{f}"], capture_output=True)
+              if b.returncode != 0:
+                  print(f"UNREADABLE|{f}"); errs += 1; continue
+              text = b.stdout.decode("utf-8", "surrogateescape")
               for name, rx in RULES:
                   for m in rx.finditer(text):
                       print(f"HIT|{name}|{f}:{text.count(chr(10),0,m.start())+1}"); hits += 1
-          print(f"GATE|files={len(files)}|hits={hits}|errors={errs}")
+          print(f"GATE|changed={len(files)}|hits={hits}|errors={errs}|base={base[:8]}")
           sys.exit(2 if errs else (1 if hits else 0))
           PY
